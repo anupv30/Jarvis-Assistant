@@ -346,6 +346,7 @@ class JarvisHUD(QMainWindow):
 
         self.last_transcript_raw = ""
         self.last_response_raw = ""
+        self.last_status_raw = ""
         self.typewriter_text = ""
         self.typewriter_idx = 0
         self.active_command_log: List[str] = []
@@ -590,7 +591,24 @@ class JarvisHUD(QMainWindow):
                 # Check command execution
                 cmd = data.get("command", "")
                 action_type = data.get("type", data.get("action", ""))
-                resp = data.get("speaking_response", data.get("speaking_start", ""))
+                exec_status = data.get("execution_status", "")
+
+                # For actions (git_action, antigravity_task), determine true response based on execution_status
+                if action_type in ["git_action", "antigravity_task"]:
+                    if exec_status == "failed":
+                        resp = data.get("speaking_response", "Git operation failed, sir.")
+                        self.lbl_response.setStyleSheet("color: #ff4444; padding: 4px;")
+                    elif exec_status == "success":
+                        resp = data.get("speaking_response", "Task completed successfully, sir.")
+                        self.lbl_response.setStyleSheet("color: #00ff88; padding: 4px;")
+                    else:
+                        # Action pending or in progress: show start announcement, never premature success
+                        resp = data.get("speaking_start") or f"Executing {data.get('task_description', 'action')}..."
+                        self.lbl_response.setStyleSheet("color: #ff9d00; padding: 4px;")
+                else:
+                    # Query or direct QA: response is immediately authoritative
+                    resp = data.get("speaking_response", data.get("speaking_start", ""))
+                    self.lbl_response.setStyleSheet("color: #00ff88; padding: 4px;")
 
                 if resp and resp != self.last_response_raw:
                     self.last_response_raw = resp
@@ -605,6 +623,30 @@ class JarvisHUD(QMainWindow):
                                 self.log_console(f">> EXECUTING: {clean_sub}", color="#00e1ff")
                             elif "cd " in clean_sub:
                                 self.log_console(f">> WORKSPACE: {clean_sub}", color="#8ca0b8")
+            except Exception:
+                pass
+
+        # 3b. Monitor Status File for real-time execution results
+        if os.path.exists(STATUS_FILE):
+            try:
+                with open(STATUS_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                    status_line = f.read().strip()
+                if status_line and status_line != self.last_status_raw:
+                    self.last_status_raw = status_line
+                    if status_line.startswith("[GIT ERROR]") or status_line.startswith("[ERROR]"):
+                        clean_err = status_line.replace("[GIT ERROR]", "").replace("[ERROR]", "").strip()
+                        self.lbl_response.setStyleSheet("color: #ff4444; padding: 4px;")
+                        self.typewriter_text = f"Git Error: {clean_err}"
+                        self.typewriter_idx = 0
+                        self.last_response_raw = self.typewriter_text
+                        self.log_console(f"EXECUTION FAILED: {clean_err}", color="#ff4444")
+                    elif status_line.startswith("[GIT SUCCESS]") or status_line.startswith("[SUCCESS]"):
+                        clean_succ = status_line.replace("[GIT SUCCESS]", "").replace("[SUCCESS]", "").strip()
+                        self.lbl_response.setStyleSheet("color: #00ff88; padding: 4px;")
+                        self.typewriter_text = clean_succ
+                        self.typewriter_idx = 0
+                        self.last_response_raw = self.typewriter_text
+                        self.log_console(f"EXECUTION SUCCESS: {clean_succ}", color="#00ff88")
             except Exception:
                 pass
 

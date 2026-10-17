@@ -211,6 +211,15 @@ def run_autonomous_pipeline(audio_path: str):
             # Step 5: Announce completion or error
             if git_proc.returncode == 0:
                 done_phrase = spk_resp or "Task completed successfully, sir."
+                try:
+                    status_path = os.path.join(PROJECT_ROOT, "last_status.txt")
+                    if os.path.exists(status_path):
+                        with open(status_path, "r", encoding="utf-8") as sf:
+                            st = sf.read().strip()
+                            if "[GIT SUCCESS]" in st:
+                                done_phrase = st.replace("[GIT SUCCESS]", "").strip()
+                except Exception:
+                    pass
                 print(f"[Jarvis Pipeline] Announcing completion: {done_phrase}")
                 subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), done_phrase], cwd=PROJECT_ROOT)
             else:
@@ -221,7 +230,8 @@ def run_autonomous_pipeline(audio_path: str):
                         with open(status_path, "r", encoding="utf-8") as sf:
                             st = sf.read().strip()
                             if "[GIT ERROR]" in st:
-                                err_phrase = f"Git error: {st.replace('[GIT ERROR]', '').strip()[:80]}, sir."
+                                raw_err = st.replace("[GIT ERROR]", "").strip()
+                                err_phrase = f"Git error: {raw_err[:120]}, sir."
                 except Exception:
                     pass
                 print(f"[Jarvis Pipeline] Announcing failure: {err_phrase}")

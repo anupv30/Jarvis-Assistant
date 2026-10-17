@@ -221,28 +221,43 @@ def handle_delete_branch(target_repo: str, branch_name: str) -> tuple[int, str]:
     if branch in ["main", "master"]:
         return 1, f"Cannot delete protected default branch '{branch}'"
 
+    # Pre-check: Does the branch exist locally or remotely?
+    loc_check = subprocess.run(["git", "show-ref", "--verify", f"refs/heads/{branch}"], cwd=target_repo, capture_output=True)
+    local_exists = (loc_check.returncode == 0)
+
+    rem_check = subprocess.run(["git", "ls-remote", "--heads", "origin", branch], cwd=target_repo, capture_output=True, text=True)
+    remote_exists = bool(rem_check.stdout.strip())
+
+    if not local_exists and not remote_exists:
+        return 1, f"Branch '{branch}' does not exist locally or on remote origin"
+
     # 1. If currently on the branch to be deleted, switch to main first
     curr_br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=target_repo, capture_output=True, text=True).stdout.strip()
     if curr_br == branch:
         print(f"[execute_git.py] Currently on '{branch}'; switching to 'main' first...")
         subprocess.run(["git", "checkout", "main"], cwd=target_repo, capture_output=True)
 
-    # 2. Delete local branch
-    print(f"[execute_git.py] Deleting local branch '{branch}'...")
-    del_local = subprocess.run(["git", "branch", "-D", branch], cwd=target_repo, capture_output=True, text=True)
-    local_msg = del_local.stdout.strip() or del_local.stderr.strip()
+    del_local_ok = False
+    del_remote_ok = False
 
-    # 3. Delete remote branch on GitHub origin
-    print(f"[execute_git.py] Deleting remote branch '{branch}' on origin...")
-    del_remote = subprocess.run(["git", "push", "origin", "--delete", branch], cwd=target_repo, capture_output=True, text=True)
-    remote_msg = del_remote.stdout.strip() or del_remote.stderr.strip()
+    # 2. Delete local branch if it exists
+    if local_exists:
+        print(f"[execute_git.py] Deleting local branch '{branch}'...")
+        del_local = subprocess.run(["git", "branch", "-D", branch], cwd=target_repo, capture_output=True, text=True)
+        del_local_ok = (del_local.returncode == 0)
+
+    # 3. Delete remote branch on GitHub origin if it exists
+    if remote_exists:
+        print(f"[execute_git.py] Deleting remote branch '{branch}' on origin...")
+        del_remote = subprocess.run(["git", "push", "origin", "--delete", branch], cwd=target_repo, capture_output=True, text=True)
+        del_remote_ok = (del_remote.returncode == 0)
 
     # 4. Prune remote tracking references
     subprocess.run(["git", "fetch", "--prune", "origin"], cwd=target_repo, capture_output=True)
 
-    if del_local.returncode == 0 or del_remote.returncode == 0:
+    if del_local_ok or del_remote_ok:
         return 0, f"Branch '{branch}' deleted successfully"
-    return 1, f"Failed to delete branch '{branch}': {local_msg} {remote_msg}"
+    return 1, f"Failed to delete branch '{branch}'"
 
 def handle_create_branch(target_repo: str, branch_name: str) -> tuple[int, str]:
     """Robustly checks out/creates a branch and pushes it to GitHub origin."""
@@ -371,18 +386,52 @@ def handle_revert_commit(target_repo: str) -> tuple[int, str]:
 
     return 0, f"Successfully reverted last commit on '{curr_branch}' and synced with GitHub"
 
+def finish_execution(success: bool, message: str, retcode: int = 0):
+    """Guarantees synchronization across last_status.txt and last_intent.json so HUD and Voice never desync."""
+    status_file = os.path.join(PROJECT_ROOT, "last_status.txt")
+    intent_file = os.path.join(PROJECT_ROOT, "last_intent.json")
+    tag = "[GIT SUCCESS]" if success else "[GIT ERROR]"
+    clean_msg = message.strip()
+    status_line = f"{tag} {clean_msg}"
+
+    try:
+        with open(status_file, "w", encoding="utf-8") as f:
+            f.write(status_line)
+    except Exception as e:
+        print(f"[execute_git.py] Error writing status file: {e}", file=sys.stderr)
+
+    try:
+        if os.path.exists(intent_file):
+            with open(intent_file, "r", encoding="utf-8") as inf:
+                idat = json.load(inf)
+            idat["execution_status"] = "success" if success else "failed"
+            idat["execution_retcode"] = retcode
+            idat["execution_message"] = clean_msg
+            if not success:
+                idat["speaking_error"] = f"Git error: {clean_msg}"
+                idat["speaking_response"] = f"Git error: {clean_msg}"
+            else:
+                if clean_msg:
+                    idat["speaking_response"] = clean_msg
+            with open(intent_file, "w", encoding="utf-8") as inf:
+                json.dump(idat, inf, indent=2)
+    except Exception as e:
+        print(f"[execute_git.py] Error updating intent file: {e}", file=sys.stderr)
+
+    sys.exit(retcode if not success else 0)
+
 def main():
     intent_file = sys.argv[1] if len(sys.argv) > 1 else os.path.join(PROJECT_ROOT, "last_intent.json")
     if not os.path.exists(intent_file):
         print(f"[execute_git.py] Error: {intent_file} does not exist.", file=sys.stderr)
-        sys.exit(1)
+        finish_execution(False, f"Intent file '{intent_file}' not found", retcode=1)
 
     try:
         with open(intent_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
         print(f"[execute_git.py] Invalid intent JSON: {e}", file=sys.stderr)
-        sys.exit(1)
+        finish_execution(False, f"Invalid intent JSON: {e}", retcode=1)
 
     # Delegate to execute_agent if Antigravity task
     if data.get("type") == "antigravity_task":
@@ -400,7 +449,6 @@ def main():
     command = data.get("command", "git status").strip()
     task_desc = data.get("task_description", "").lower()
     target_repo = get_target_repo()
-    status_file = os.path.join(PROJECT_ROOT, "last_status.txt")
 
     # 1. Dedicated Handler for Branch Deletion
     if action == "delete_branch" or "branch -d" in command.lower() or ("branch" in task_desc and ("delete" in task_desc or "remove" in task_desc)):
@@ -413,14 +461,11 @@ def main():
         print(f"[Jarvis Executing]: Robust Branch Deletion '{bname}' in '{target_repo}'")
         retcode, out_msg = handle_delete_branch(target_repo, bname)
         print(f"[execute_git.py] {out_msg} (Exit code: {retcode})")
-        if retcode != 0:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT ERROR] {out_msg}")
-            sys.exit(retcode)
-        else:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT SUCCESS] {data.get('speaking_response', f'Branch {bname} deleted.')}")
-            sys.exit(0)
+        finish_execution(
+            success=(retcode == 0),
+            message=out_msg if retcode != 0 else data.get('speaking_response', f"Branch '{bname}' has been deleted successfully, sir."),
+            retcode=retcode
+        )
 
     # 2. Dedicated Handler for Branch Creation & Push
     elif action == "create_branch" or "checkout -b" in command or ("branch" in task_desc and ("create" in task_desc or "make" in task_desc)):
@@ -433,14 +478,11 @@ def main():
         print(f"[Jarvis Executing]: Robust Branch Creation '{bname}' in '{target_repo}'")
         retcode, out_msg = handle_create_branch(target_repo, bname)
         print(f"[execute_git.py] {out_msg} (Exit code: {retcode})")
-        if retcode != 0:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT ERROR] {out_msg}")
-            sys.exit(retcode)
-        else:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT SUCCESS] {data.get('speaking_response', f'Branch {bname} created and pushed.')}")
-            sys.exit(0)
+        finish_execution(
+            success=(retcode == 0),
+            message=out_msg if retcode != 0 else data.get('speaking_response', f"Branch '{bname}' created and pushed to GitHub, sir."),
+            retcode=retcode
+        )
 
     # 3. Dedicated Handler for Repository Creation & Push
     elif action in ["create_repo", "new_repo"] or "repo create" in command.lower() or ("repo" in task_desc and any(w in task_desc for w in ["create", "new", "make", "named", "called"])):
@@ -448,51 +490,40 @@ def main():
         print(f"[Jarvis Executing]: Robust GitHub Repository Creation & Push '{target_name}' for '{target_repo}'")
         retcode, out_msg = handle_create_repo_and_push(target_repo, target_name)
         print(f"[execute_git.py] {out_msg} (Exit code: {retcode})")
-        if retcode != 0:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT ERROR] {out_msg}")
-            sys.exit(retcode)
-        else:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT SUCCESS] {data.get('speaking_response', f'Repository {target_name} created and files pushed.')}")
-            sys.exit(0)
+        finish_execution(
+            success=(retcode == 0),
+            message=out_msg if retcode != 0 else data.get('speaking_response', f"Repository '{target_name}' created and files pushed."),
+            retcode=retcode
+        )
 
     # 4. Dedicated Handler for Revert / Undo Commit
     elif action in ["revert_commit", "revert", "undo_commit"] or "revert" in command.lower() or "revert" in task_desc or "undo commit" in task_desc or "undo last commit" in task_desc:
         print(f"[Jarvis Executing]: Robust Git Revert in '{target_repo}'")
         retcode, out_msg = handle_revert_commit(target_repo)
         print(f"[execute_git.py] {out_msg} (Exit code: {retcode})")
-        if retcode != 0:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT ERROR] {out_msg}")
-            sys.exit(retcode)
-        else:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT SUCCESS] {data.get('speaking_response', 'The last committed changes have been reverted successfully, sir.')}")
-            sys.exit(0)
+        finish_execution(
+            success=(retcode == 0),
+            message=out_msg if retcode != 0 else data.get('speaking_response', 'The last committed changes have been reverted successfully, sir.'),
+            retcode=retcode
+        )
 
     # 5. Dedicated Handler for Discarding Uncommitted Changes
     elif action in ["discard_uncommitted", "discard_changes"] or "discard uncommitted" in command.lower() or "discard uncommitted" in task_desc or "discard changes" in task_desc or "discard local changes" in task_desc:
         print(f"[Jarvis Executing]: Discarding Uncommitted Changes in '{target_repo}'")
         subprocess.run(["git", "restore", "."], cwd=target_repo, capture_output=True)
         subprocess.run(["git", "clean", "-fd"], cwd=target_repo, capture_output=True)
-        with open(status_file, "w", encoding="utf-8") as f:
-            f.write(f"[GIT SUCCESS] {data.get('speaking_response', 'All uncommitted local changes have been discarded, sir.')}")
-        sys.exit(0)
+        finish_execution(True, data.get('speaking_response', 'All uncommitted local changes have been discarded, sir.'), retcode=0)
 
     # 6. Dedicated Handler for Commit & Push
     elif "push" in command or "push" in task_desc or "commit" in task_desc:
         print(f"[Jarvis Executing]: Robust Git Commit & Push in '{target_repo}'")
         retcode, out_msg = handle_commit_and_push(target_repo)
         print(f"[execute_git.py] {out_msg} (Exit code: {retcode})")
-        if retcode != 0:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT ERROR] {out_msg}")
-            sys.exit(retcode)
-        else:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT SUCCESS] {data.get('speaking_response', 'Git action completed.')}")
-            sys.exit(0)
+        finish_execution(
+            success=(retcode == 0),
+            message=out_msg if retcode != 0 else data.get('speaking_response', 'Git action completed successfully, sir.'),
+            retcode=retcode
+        )
 
     print(f"[Jarvis Executing]: '{command}' in '{target_repo}'")
 
@@ -514,37 +545,13 @@ def main():
         if proc.returncode != 0:
             err_details = proc.stderr.strip() or proc.stdout.strip() or f"Execution failed with code {proc.returncode}"
             print(f"[execute_git.py] Git execution FAILED: {err_details}", file=sys.stderr)
-            try:
-                with open(status_file, "w", encoding="utf-8") as f:
-                    f.write(f"[GIT ERROR] {err_details}")
-            except Exception:
-                pass
-            try:
-                if os.path.exists(intent_file):
-                    with open(intent_file, "r", encoding="utf-8") as inf:
-                        idat = json.load(inf)
-                    idat["speaking_error"] = f"Git operation failed, sir: {err_details[:80]}"
-                    with open(intent_file, "w", encoding="utf-8") as inf:
-                        json.dump(idat, inf, indent=2)
-            except Exception:
-                pass
-            sys.exit(proc.returncode)
+            finish_execution(False, err_details, retcode=proc.returncode)
 
         # Execution succeeded
-        try:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT SUCCESS] {data.get('speaking_response', 'Git action completed.')}")
-        except Exception:
-            pass
-        sys.exit(0)
+        finish_execution(True, data.get('speaking_response', 'Git action completed successfully, sir.'), retcode=0)
     except Exception as e:
         print(f"[execute_git.py] Execution error: {e}", file=sys.stderr)
-        try:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT ERROR] {e}")
-        except Exception:
-            pass
-        sys.exit(1)
+        finish_execution(False, str(e), retcode=1)
 
 if __name__ == "__main__":
     main()

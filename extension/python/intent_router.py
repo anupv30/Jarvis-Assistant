@@ -833,6 +833,21 @@ def build_default_intent(transcript: str) -> dict:
     # 3. Branch Deletion Intent (Protected by Two-Turn Voice Confirmation & Auto-Safety Tag)
     if is_branch_deletion(transcript):
         bname = extract_branch_name(transcript)
+        # Pre-check: Verify if branch exists locally or remotely before prompting for confirmation
+        loc_check = subprocess.run(["git", "show-ref", "--verify", f"refs/heads/{bname}"], cwd=target_repo, capture_output=True)
+        rem_check = subprocess.run(["git", "ls-remote", "--heads", "origin", bname], cwd=target_repo, capture_output=True, text=True)
+        if loc_check.returncode != 0 and not rem_check.stdout.strip():
+            return {
+                "type": "git_query",
+                "action": "branch_not_found",
+                "target_file": "",
+                "task_description": f"Branch {bname} not found",
+                "command": "git branch -a",
+                "speaking_start": "",
+                "speaking_progress": "",
+                "speaking_response": f"Branch '{bname}' does not exist in this repository, sir.",
+            }
+
         safety_tag = create_branch_safety_snapshot(target_repo, bname)
         save_pending_action({
             "action_name": f"deletion of branch {bname}",
