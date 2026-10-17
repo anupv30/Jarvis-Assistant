@@ -321,56 +321,6 @@ def handle_commit_and_push(target_repo: str) -> tuple[int, str]:
 
     return 0, f"Successfully pushed to GitHub ({curr_branch})"
 
-def handle_revert_commit(target_repo: str) -> tuple[int, str]:
-    """Robustly reverts the last commit and syncs the reverted state to GitHub."""
-    print(f"[execute_git.py] Checking repository status before revert in '{target_repo}'...")
-
-    # 1. Detect current branch
-    br_proc = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=target_repo, capture_output=True, text=True)
-    curr_branch = br_proc.stdout.strip() or "main"
-
-    # 2. Check if git log has commits to revert
-    log_check = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=target_repo, capture_output=True, text=True)
-    if log_check.returncode != 0:
-        return 1, "No commits found to revert in the active repository."
-
-    # 3. Perform git revert HEAD --no-edit
-    print(f"[execute_git.py] Reverting HEAD commit on branch '{curr_branch}'...")
-    revert_proc = subprocess.run(
-        ["git", "revert", "HEAD", "--no-edit"],
-        cwd=target_repo,
-        capture_output=True,
-        text=True
-    )
-
-    if revert_proc.returncode != 0:
-        err = revert_proc.stderr.strip() or revert_proc.stdout.strip()
-        print(f"[execute_git.py] Git revert error: {err}")
-        return revert_proc.returncode, f"Git revert failed: {err}"
-
-    print(f"[execute_git.py] Local revert commit successful. Pushing to origin/{curr_branch}...")
-
-    # 4. Push to remote origin
-    push_proc = subprocess.run(
-        ["git", "push", "origin", curr_branch],
-        cwd=target_repo,
-        capture_output=True,
-        text=True
-    )
-
-    if push_proc.returncode != 0:
-        err = push_proc.stderr.strip() or push_proc.stdout.strip()
-        print(f"[execute_git.py] Warning: Push after revert failed: {err}")
-        return 0, f"Commit reverted locally, but GitHub sync failed: {err}"
-
-    # Synchronize main/master if applicable
-    if curr_branch == "main":
-        subprocess.run(["git", "push", "origin", "main:master"], cwd=target_repo, capture_output=True)
-    elif curr_branch == "master":
-        subprocess.run(["git", "push", "origin", "master:main"], cwd=target_repo, capture_output=True)
-
-    return 0, f"Successfully reverted last commit on '{curr_branch}' and synced with GitHub"
-
 def main():
     intent_file = sys.argv[1] if len(sys.argv) > 1 else os.path.join(PROJECT_ROOT, "last_intent.json")
     if not os.path.exists(intent_file):
@@ -457,21 +407,7 @@ def main():
                 f.write(f"[GIT SUCCESS] {data.get('speaking_response', f'Repository {target_name} created and files pushed.')}")
             sys.exit(0)
 
-    # 4. Dedicated Handler for Revert / Undo Commit
-    elif action in ["revert_commit", "revert", "undo_commit"] or "revert" in command.lower() or "revert" in task_desc or "undo commit" in task_desc or "undo last commit" in task_desc:
-        print(f"[Jarvis Executing]: Robust Git Revert in '{target_repo}'")
-        retcode, out_msg = handle_revert_commit(target_repo)
-        print(f"[execute_git.py] {out_msg} (Exit code: {retcode})")
-        if retcode != 0:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT ERROR] {out_msg}")
-            sys.exit(retcode)
-        else:
-            with open(status_file, "w", encoding="utf-8") as f:
-                f.write(f"[GIT SUCCESS] {data.get('speaking_response', 'The last committed changes have been reverted successfully, sir.')}")
-            sys.exit(0)
-
-    # 5. Dedicated Handler for Commit & Push
+    # 4. Dedicated Handler for Commit & Push
     elif "push" in command or "push" in task_desc or "commit" in task_desc:
         print(f"[Jarvis Executing]: Robust Git Commit & Push in '{target_repo}'")
         retcode, out_msg = handle_commit_and_push(target_repo)

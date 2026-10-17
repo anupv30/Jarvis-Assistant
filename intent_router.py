@@ -532,14 +532,6 @@ def extract_repo_name(t: str, default: str = "project-repo") -> str:
 
     return default
 
-def is_revert_intent(transcript: str) -> bool:
-    """Detects intent to revert or undo a git commit."""
-    t = transcript.lower()
-    return any(k in t for k in [
-        "revert", "undo commit", "undo the commit", "undo last commit",
-        "rollback commit", "roll back commit", "revert changes", "revert commit"
-    ])
-
 def build_default_intent(transcript: str) -> dict:
     target_repo = get_target_repo()
     proj_name = get_project_name(target_repo)
@@ -642,20 +634,7 @@ def build_default_intent(transcript: str) -> dict:
             "speaking_response": f"Repository {repo_name} has been created on GitHub and files pushed successfully, sir.",
         }
 
-    # 6. Revert / Undo Commit Intent (MUST precede standard commit & push check)
-    if is_revert_intent(transcript):
-        return {
-            "type": "git_action",
-            "action": "revert_commit",
-            "target_file": "",
-            "task_description": "Revert last commit",
-            "command": f'{cd_prefix} && git revert HEAD --no-edit && git push origin',
-            "speaking_start": "Reverting the last commit and syncing with GitHub, sir.",
-            "speaking_progress": "Reverting commit...",
-            "speaking_response": "The last committed changes have been reverted and synced with GitHub, sir.",
-        }
-
-    # 7. Standard Git Commit & Push Intent
+    # 6. Standard Git Commit & Push Intent
     if any(w in t for w in ["push", "commit", "repo", "github"]):
         return {
             "type": "git_action",
@@ -821,11 +800,7 @@ def sanitize_json(raw_text: str, transcript: str) -> dict:
         }
 
     if req_type == "git_action":
-        if is_revert_intent(transcript):
-            cmd = f'{cd_prefix} && git revert HEAD --no-edit && git push origin'
-            start = "Reverting the last commit and syncing with GitHub, sir."
-            speaking_resp = "The last committed changes have been reverted and synced with GitHub, sir."
-        elif is_branch_creation(transcript):
+        if is_branch_creation(transcript):
             bname = extract_branch_name(transcript)
             cmd = f'{cd_prefix} && git checkout -b {bname} && git push -u origin {bname}'
             start = f"Creating and pushing branch {bname} to GitHub, sir."
@@ -936,11 +911,7 @@ def route_intent(transcript: str) -> dict:
     if is_repo_creation(cleaned):
         return build_default_intent(cleaned)
 
-    # 5. IMMEDIATE ROUTING: Git commit revert
-    if is_revert_intent(cleaned):
-        return build_default_intent(cleaned)
-
-    # 6. IMMEDIATE ROUTING: Antigravity task regex/classifier match
+    # 5. IMMEDIATE ROUTING: Antigravity task regex/classifier match
     if is_antigravity_intent(cleaned):
         return build_default_intent(cleaned)
 
