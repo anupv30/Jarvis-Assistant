@@ -165,10 +165,24 @@ def is_antigravity_intent(transcript: str) -> bool:
             return True
     return any(w in t for w in ANTIGRAVITY_TRIGGER_KEYWORDS)
 
+def is_revert_action(transcript: str) -> bool:
+    """Detects command to execute git revert (action), not a question about history."""
+    t = transcript.lower().strip()
+    if any(q in t for q in ["what was", "what is", "tell me", "show me", "which was", "how many", "did we", "who reverted"]):
+        return False
+    return any(k in t for k in [
+        "revert the last commit", "revert last commit", "revert the commit", "revert commit",
+        "revert the committed changes", "revert committed changes", "revert changes",
+        "undo the last commit", "undo last commit", "undo the commit", "undo commit",
+        "rollback the last commit", "rollback last commit", "rollback commit"
+    ]) or bool(re.search(r'^(?:please\s+|jarvis\s+)?(?:revert|undo|rollback)\b', t))
+
 def is_git_query(transcript: str) -> bool:
     """Detects informational git questions (NOT action commands).
     Examples: 'what branch am I on?', 'which branch am I in?', 'show me git status'
     """
+    if is_revert_action(transcript):
+        return False
     t = transcript.lower()
     # Question patterns about git state
     query_patterns = [
@@ -597,7 +611,20 @@ def build_default_intent(transcript: str) -> dict:
     cd_prefix = f'cd "{target_repo}"'
     t = transcript.lower()
 
-    # 1. Antigravity Coding, Bug Fixing, App Creation, HUD & Theme Intent (Immediate Priority)
+    # 1. Revert Action Intent (IMMEDIATE TOP PRIORITY: Action command to undo/revert commit)
+    if is_revert_action(transcript):
+        return {
+            "type": "git_action",
+            "action": "revert_commit",
+            "target_file": "",
+            "task_description": "Revert last commit",
+            "command": f'{cd_prefix} && git revert HEAD --no-edit && git push origin',
+            "speaking_start": "Reverting the last commit and syncing with GitHub, sir.",
+            "speaking_progress": "Reverting commit...",
+            "speaking_response": "The last committed changes have been reverted and synced with GitHub, sir.",
+        }
+
+    # 2. Antigravity Coding, Bug Fixing, App Creation, HUD & Theme Intent
     if is_antigravity_intent(transcript):
         target_file = extract_target_file(transcript)
         target_path = os.path.join(target_repo, target_file)
@@ -971,7 +998,11 @@ def route_intent(transcript: str) -> dict:
     if not cleaned or len(cleaned) < 2:
         return build_default_intent(cleaned)
 
-    # 1. IMMEDIATE ROUTING: Git informational queries
+    # 1. IMMEDIATE ROUTING: Git commit revert action
+    if is_revert_action(cleaned):
+        return build_default_intent(cleaned)
+
+    # 2. IMMEDIATE ROUTING: Git informational queries
     if is_git_query(cleaned):
         return build_default_intent(cleaned)
 
