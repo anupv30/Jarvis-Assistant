@@ -44,6 +44,7 @@ STATUS_CACHE_FILE = os.path.join(JARVIS_CORE_DIR, "last_status.txt")
 CODEBASE_CACHE_FILE = os.path.join(JARVIS_CORE_DIR, "codebase_cache.json")
 ANTIGRAVITY_TASK_FILE = os.path.join(JARVIS_CORE_DIR, "antigravity_task.json")
 ANTIGRAVITY_PROMPT_FILE = os.path.join(JARVIS_CORE_DIR, "antigravity_prompt.txt")
+PENDING_ACTION_FILE = os.path.join(JARVIS_CORE_DIR, "pending_action.json")
 
 def get_project_context(force_refresh: bool = False) -> str:
     """Scans and caches key project source files to answer codebase questions with zero delay."""
@@ -165,6 +166,122 @@ def is_antigravity_intent(transcript: str) -> bool:
             return True
     return any(w in t for w in ANTIGRAVITY_TRIGGER_KEYWORDS)
 
+def load_pending_action() -> dict | None:
+    """Reads pending confirmation action if not expired (45s TTL)."""
+    if not os.path.exists(PENDING_ACTION_FILE):
+        return None
+    try:
+        with open(PENDING_ACTION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if time.time() <= data.get("expires_at", 0):
+            return data
+        os.remove(PENDING_ACTION_FILE)
+    except Exception:
+        pass
+    return None
+
+def save_pending_action(action_data: dict):
+    """Saves a pending action requiring confirmation with 45s expiration."""
+    action_data["created_at"] = time.time()
+    action_data["expires_at"] = time.time() + 45
+    try:
+        with open(PENDING_ACTION_FILE, "w", encoding="utf-8") as f:
+            json.dump(action_data, f, indent=2)
+    except Exception as e:
+        print(f"[intent_router.py] Warning: Could not save pending action: {e}", file=sys.stderr)
+
+def clear_pending_action():
+    """Clears any pending confirmation action."""
+    if os.path.exists(PENDING_ACTION_FILE):
+        try:
+            os.remove(PENDING_ACTION_FILE)
+        except Exception:
+            pass
+
+def is_confirmation_yes(transcript: str) -> bool:
+    """Detects affirmative confirmation to proceed with pending destructive action."""
+    t = transcript.lower().strip().rstrip(".!?,")
+    yes_exact = [
+        "yes", "yeah", "yep", "sure", "confirm", "proceed", "go ahead",
+        "do it", "authorize", "approved", "affirmative", "yes please",
+        "yes confirm", "yes do it", "yes delete it", "yes proceed", "i confirm"
+    ]
+    if t in yes_exact:
+        return True
+    return any(t.startswith(w) for w in ["yes", "confirm", "proceed", "authorize", "go ahead"])
+
+def is_confirmation_no(transcript: str) -> bool:
+    """Detects negative response or cancellation of pending action."""
+    t = transcript.lower().strip().rstrip(".!?,")
+    no_exact = [
+        "no", "nope", "cancel", "stop", "abort", "nevermind",
+        "negative", "don't", "dont", "do not", "no cancel", "no don't"
+    ]
+    if t in no_exact:
+        return True
+    return any(t.startswith(w) for w in ["no", "cancel", "stop", "abort", "nevermind", "don't", "dont"])
+
+def create_branch_safety_snapshot(target_repo: str, branch_name: str) -> str:
+    """Creates a safety backup git tag for a branch before deletion."""
+    clean_b = branch_name.strip(".-/ \t\r\n")
+    tag_name = f"safety_backup_{clean_b.replace('/', '_')}"
+    try:
+        subprocess.run(["git", "tag", "-f", tag_name, clean_b], cwd=target_repo, capture_output=True)
+        return tag_name
+    except Exception:
+        return ""
+
+def is_restore_backup_intent(transcript: str) -> bool:
+    """Detects intent to restore a branch from safety snapshot."""
+    t = transcript.lower()
+    return any(k in t for k in [
+        "restore deleted branch", "recover deleted branch", "undo branch deletion",
+        "restore branch", "recover branch", "restore from safety backup", "restore from backup",
+        "undo deletion", "restore the branch"
+    ])
+
+def handle_safety_restore_intent(transcript: str) -> dict:
+    """Restores a branch from the latest or specified safety snapshot."""
+    target_repo = get_target_repo()
+    cd_prefix = f'cd "{target_repo}"'
+    tags_proc = subprocess.run(["git", "tag", "-l", "safety_backup_*"], cwd=target_repo, capture_output=True, text=True)
+    tags = [t.strip() for t in tags_proc.stdout.splitlines() if t.strip()]
+    if not tags:
+        return {
+            "type": "git_query",
+            "action": "",
+            "target_file": "",
+            "task_description": "Safety backup restore check",
+            "command": "git status --short",
+            "speaking_start": "",
+            "speaking_progress": "",
+            "speaking_response": "No safety backup snapshots found in this repository, sir.",
+        }
+    t_lower = transcript.lower()
+    selected_tag = None
+    target_bname = None
+    for tag in reversed(tags):
+        b_cand = tag.replace("safety_backup_", "")
+        if b_cand in t_lower:
+            selected_tag = tag
+            target_bname = b_cand
+            break
+    if not selected_tag:
+        selected_tag = tags[-1]
+        target_bname = selected_tag.replace("safety_backup_", "")
+
+    cmd = f'{cd_prefix} && (git checkout -b {target_bname} {selected_tag} 2>nul || git checkout {target_bname}) && git push -u origin {target_bname}'
+    return {
+        "type": "git_action",
+        "action": "restore_safety_backup",
+        "target_file": "",
+        "task_description": f"Restore branch {target_bname} from safety snapshot {selected_tag}",
+        "command": cmd,
+        "speaking_start": f"Restoring branch {target_bname} from safety backup snapshot, sir.",
+        "speaking_progress": "",
+        "speaking_response": f"Branch {target_bname} has been successfully restored from your safety snapshot and synced to GitHub, sir.",
+    }
+
 def is_revert_action(transcript: str) -> bool:
     """Detects command to execute git revert (action), not a question about history."""
     t = transcript.lower().strip()
@@ -191,7 +308,9 @@ def is_git_query(transcript: str) -> bool:
     """Detects informational git questions (NOT action commands).
     Examples: 'what branch am I on?', 'which branch am I in?', 'show me git status'
     """
-    if is_revert_action(transcript) or is_discard_intent(transcript):
+    if (is_revert_action(transcript) or is_discard_intent(transcript) or
+        is_confirmation_yes(transcript) or is_confirmation_no(transcript) or
+        is_restore_backup_intent(transcript)):
         return False
     t = transcript.lower()
     # Question patterns about git state
@@ -634,17 +753,31 @@ def build_default_intent(transcript: str) -> dict:
             "speaking_response": "The last committed changes have been reverted and synced with GitHub, sir.",
         }
 
-    # 2. Discard Uncommitted Changes Intent
+    # 2. Discard Uncommitted Changes Intent (Protected by Two-Turn Voice Confirmation)
     if is_discard_intent(transcript):
+        save_pending_action({
+            "action_name": "discarding uncommitted local changes",
+            "target": "uncommitted_changes",
+            "confirmed_intent": {
+                "type": "git_action",
+                "action": "discard_uncommitted",
+                "target_file": "",
+                "task_description": "Discard uncommitted local changes",
+                "command": f'{cd_prefix} && git restore . && git clean -fd',
+                "speaking_start": "Confirmation received. Discarding all uncommitted local modifications, sir.",
+                "speaking_progress": "Resetting working tree...",
+                "speaking_response": "All uncommitted local changes have been discarded, sir.",
+            }
+        })
         return {
-            "type": "git_action",
-            "action": "discard_uncommitted",
+            "type": "git_query",
+            "action": "awaiting_confirmation",
             "target_file": "",
-            "task_description": "Discard uncommitted local changes",
-            "command": f'{cd_prefix} && git restore . && git clean -fd',
-            "speaking_start": "Discarding all uncommitted local modifications, sir.",
-            "speaking_progress": "Resetting working tree...",
-            "speaking_response": "All uncommitted local changes have been discarded, sir.",
+            "task_description": "Security guard awaiting voice confirmation to discard changes",
+            "command": "git status --short",
+            "speaking_start": "",
+            "speaking_progress": "",
+            "speaking_response": "Security warning: This will permanently wipe all your uncommitted local modifications. Are you sure you wish to proceed, sir?",
         }
 
     # 3. Antigravity Coding, Bug Fixing, App Creation, HUD & Theme Intent
@@ -697,20 +830,36 @@ def build_default_intent(transcript: str) -> dict:
             "speaking_response": speaking_resp,
         }
 
-    # 3. Branch Deletion Intent (git branch -D <branch> && git push origin --delete <branch>)
+    # 3. Branch Deletion Intent (Protected by Two-Turn Voice Confirmation & Auto-Safety Tag)
     if is_branch_deletion(transcript):
         bname = extract_branch_name(transcript)
+        safety_tag = create_branch_safety_snapshot(target_repo, bname)
+        save_pending_action({
+            "action_name": f"deletion of branch {bname}",
+            "target": bname,
+            "safety_tag": safety_tag,
+            "confirmed_intent": {
+                "type": "git_action",
+                "action": "delete_branch",
+                "target_file": "",
+                "task_description": f"Delete branch {bname}",
+                "command": (
+                    f'{cd_prefix} && git branch -D {bname} && git push origin --delete {bname}'
+                ),
+                "speaking_start": f"Confirmation received. Deleting branch {bname} locally and from GitHub, sir.",
+                "speaking_progress": "",
+                "speaking_response": f"Branch {bname} has been deleted successfully, sir.",
+            }
+        })
         return {
-            "type": "git_action",
-            "action": "delete_branch",
+            "type": "git_query",
+            "action": "awaiting_confirmation",
             "target_file": "",
-            "task_description": f"Delete branch {bname}",
-            "command": (
-                f'{cd_prefix} && git branch -D {bname} && git push origin --delete {bname}'
-            ),
-            "speaking_start": f"Deleting branch {bname} locally and from GitHub, sir.",
+            "task_description": f"Security guard awaiting voice confirmation to delete branch {bname}",
+            "command": "git status --short",
+            "speaking_start": "",
             "speaking_progress": "",
-            "speaking_response": f"Branch {bname} has been deleted successfully, sir.",
+            "speaking_response": f"Security warning: This will permanently delete branch '{bname}' locally and from GitHub. A safety backup snapshot has been created. Are you sure you wish to proceed, sir?",
         }
 
     # 4. Branch Creation & Push Intent (Strict command: git checkout -b <branch> && git push -u origin <branch>)
@@ -1020,6 +1169,31 @@ def route_intent(transcript: str) -> dict:
     cleaned = transcript.strip()
     if not cleaned or len(cleaned) < 2:
         return build_default_intent(cleaned)
+
+    # 0. TWO-TURN VOICE CONFIRMATION GUARD (Pending destructive action check)
+    pending = load_pending_action()
+    if pending:
+        if is_confirmation_yes(cleaned):
+            clear_pending_action()
+            return pending.get("confirmed_intent", build_default_intent(cleaned))
+        elif is_confirmation_no(cleaned):
+            clear_pending_action()
+            return {
+                "type": "git_query",
+                "action": "action_cancelled",
+                "target_file": "",
+                "task_description": "User cancelled pending destructive action",
+                "command": "git status --short",
+                "speaking_start": "",
+                "speaking_progress": "",
+                "speaking_response": "Action cancelled, sir. Your branches and code remain completely safe.",
+            }
+        else:
+            clear_pending_action()
+
+    # RESTORE SAFETY BACKUP SNAPSHOT (Idea 4 Recovery)
+    if is_restore_backup_intent(cleaned):
+        return handle_safety_restore_intent(cleaned)
 
     # 1. IMMEDIATE ROUTING: Git commit revert action
     if is_revert_action(cleaned):
