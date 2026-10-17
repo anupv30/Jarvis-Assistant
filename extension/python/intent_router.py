@@ -177,6 +177,10 @@ def is_git_query(transcript: str) -> bool:
         r'\b(?:what|which|show)\b.*\b(?:status|log|remote|diff|changes)\b',
         r'\b(?:am i on|are we on)\b.*\bbranch\b',
         r'\b(?:show|list|display)\b.*\b(?:branches|remotes|tags)\b',
+        r'\b(?:what|which|show|tell|check|who)\b.*\b(?:commit|committed|revert|reverted)\b',
+        r'\b(?:last|latest|recent|previous)\b.*\b(?:commit|committed|revert|reverted|change|changes|one)\b',
+        r'\bwhat\s+(?:did\s+i|was)\s+(?:commit|revert|changed)\b',
+        r'\b(?:what was the last|what is the last|tell me the last|show the last)\b',
     ]
     for p in query_patterns:
         if re.search(p, t):
@@ -421,8 +425,12 @@ def resolve_git_query_command(transcript: str) -> str:
         return "git branch -a"
     if any(w in t for w in ["status", "changes", "uncommitted", "modified"]):
         return "git status --short"
-    if any(w in t for w in ["log", "commit history", "last commit", "recent commit"]):
-        return "git log --oneline -5"
+    if any(w in t for w in [
+        "log", "commit history", "last commit", "recent commit", "last committed",
+        "committed one", "reverted one", "last revert", "latest revert", "reverted",
+        "what was the last", "previous commit", "what did i commit", "what was committed"
+    ]):
+        return "git log -n 8 --format=%h|||%s|||%cr"
     if any(w in t for w in ["remote", "origin", "url"]):
         return "git remote -v"
     if any(w in t for w in ["diff", "difference"]):
@@ -488,9 +496,52 @@ def execute_git_query(git_cmd: str, transcript: str) -> str:
             return "Your working tree has uncommitted modifications, sir."
         elif "log" in git_cmd:
             if not out:
-                return "No commit history found, sir."
-            first_line = out.splitlines()[0] if out.splitlines() else out
-            return f"The latest commit is: {first_line}, sir."
+                return "No commit history found in this repository, sir."
+            lines = [l.strip() for l in out.splitlines() if l.strip()]
+            if not lines:
+                return "No commits found in git log, sir."
+
+            # Parse top commit
+            top_parts = lines[0].split("|||")
+            top_subj = top_parts[1].replace('"', '').replace("'", "") if len(top_parts) > 1 else lines[0]
+            top_time = top_parts[2] if len(top_parts) > 2 else "recently"
+            is_top_revert = top_subj.lower().startswith("revert")
+
+            # Check for any revert commit in recent history
+            revert_line = next((l for l in lines if "|||" in l and l.split("|||")[1].lower().startswith("revert")), None)
+            revert_subj = None
+            revert_time = None
+            if revert_line:
+                r_parts = revert_line.split("|||")
+                revert_subj = r_parts[1].replace('"', '').replace("'", "")
+                revert_time = r_parts[2] if len(r_parts) > 2 else "recently"
+
+            t_lower = transcript.lower()
+
+            # Case A: User explicitly asks for "last committed or reverted" or "commit or revert"
+            if any(w in t_lower for w in ["revert", "reverted"]) and any(w in t_lower for w in ["commit", "committed"]):
+                if is_top_revert:
+                    non_rev = next((l for l in lines[1:] if "|||" in l and not l.split("|||")[1].lower().startswith("revert")), None)
+                    prev_subj = non_rev.split("|||")[1].replace('"', '').replace("'", "") if non_rev else None
+                    if prev_subj:
+                        return f"The latest action was a revert: {top_subj}, {top_time}. The commit prior to it was: {prev_subj}, sir."
+                    return f"The latest action was a revert: {top_subj}, {top_time}, sir."
+                else:
+                    if revert_subj:
+                        return f"The last committed change was: {top_subj}, {top_time}. And the last reverted one was: {revert_subj}, {revert_time}, sir."
+                    return f"The last committed change was: {top_subj}, {top_time}, and there are no recent reverts, sir."
+
+            # Case B: User specifically asks only for the last revert
+            elif any(w in t_lower for w in ["revert", "reverted"]):
+                if revert_subj:
+                    return f"The last reverted change was: {revert_subj}, made {revert_time}, sir."
+                return "There are no revert commits found in recent history, sir."
+
+            # Case C: General last commit question
+            else:
+                if is_top_revert:
+                    return f"The latest commit is a revert: {top_subj}, made {top_time}, sir."
+                return f"The latest commit is: {top_subj}, made {top_time}, sir."
         elif "remote" in git_cmd:
             if not out:
                 return "No remote repositories configured, sir."
