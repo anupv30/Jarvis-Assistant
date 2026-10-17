@@ -336,8 +336,8 @@ def is_branch_deletion(transcript: str) -> bool:
     if is_git_query(transcript):
         return False
     patterns = [
-        r'\b(?:delete|remove|drop|destroy)\s+(?:the\s+)?(?:a\s+)?branch\b',
-        r'\bbranch\s+(?:delete|deletion|remove|removal)\b',
+        r'\b(?:delete|remove|drop|destroy)\s+.*?\bbranch\b',
+        r'\bbranch\s+.*?\b(?:delete|deletion|remove|removal|drop|destroy)\b',
     ]
     return any(bool(re.search(p, t)) for p in patterns)
 
@@ -348,9 +348,9 @@ def is_branch_creation(transcript: str) -> bool:
     if is_git_query(transcript) or is_branch_deletion(transcript):
         return False
     patterns = [
-        r'\b(?:create|make|checkout\s+-b|new)\s+(?:a\s+)?branch\b',
+        r'\b(?:create|make|checkout\s+-b|new)\s+.*?\bbranch\b',
+        r'\bbranch\s+.*?\b(?:create|creation|make|new)\b',
         r'\bbranch\s+(?:called|named)\b',
-        r'\bcreate\s+branch\b',
     ]
     return any(bool(re.search(p, t)) for p in patterns)
 
@@ -358,14 +358,21 @@ def extract_branch_name(transcript: str) -> str:
     """Extracts and sanitizes git branch name from user speech.
     e.g. 'create a branch called jarvis test' -> 'jarvis-test'
          'delete branch jarvis-test' -> 'jarvis-test'
+         'can you delete test branch' -> 'test'
          'create branch feature' -> 'feature'
     """
     t = transcript.strip()
     raw = ""
-    # Check deletion commands first
+    # Check deletion commands first: 'delete branch <name>' or 'delete <name> branch'
     m_del = re.search(r'(?:delete|remove|drop|destroy)\s+(?:the\s+)?(?:a\s+)?branch\s+(?:called\s+|named\s+)?([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
     if m_del:
         raw = m_del.group(1).strip()
+    if not raw:
+        m_del_rev = re.search(r'(?:delete|remove|drop|destroy)\s+(?:the\s+)?(?:a\s+)?([a-zA-Z0-9_\-\.\/]+)\s+branch', t, re.IGNORECASE)
+        if m_del_rev:
+            cand = m_del_rev.group(1).strip()
+            if cand.lower() not in ["the", "a", "this", "that"]:
+                raw = cand
     if not raw:
         m = re.search(r'branch\s+(?:called|named|as)\s+([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
         if m:
@@ -374,6 +381,12 @@ def extract_branch_name(transcript: str) -> str:
         m2 = re.search(r'(?:create|make|checkout|switch to|new)\s+(?:a\s+)?branch\s+([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
         if m2:
             raw = m2.group(1).strip()
+    if not raw:
+        m_create_rev = re.search(r'(?:create|make|checkout|new)\s+(?:the\s+)?(?:a\s+)?([a-zA-Z0-9_\-\.\/]+)\s+branch', t, re.IGNORECASE)
+        if m_create_rev:
+            cand = m_create_rev.group(1).strip()
+            if cand.lower() not in ["the", "a", "this", "that", "new"]:
+                raw = cand
     if not raw:
         m3 = re.search(r'(?:called|named)\s+([a-zA-Z0-9_\-\.\/\s]+)', t, re.IGNORECASE)
         if m3:
