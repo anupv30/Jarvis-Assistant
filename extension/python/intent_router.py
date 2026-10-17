@@ -713,9 +713,25 @@ def build_default_intent(transcript: str) -> dict:
             "speaking_response": f"Branch {bname} has been deleted successfully, sir.",
         }
 
-    # 4. Branch Creation & Push Intent (Strict command: git checkout -b <branch> && git push -u origin <branch>)
+    # 4. Branch Creation & Push Intent (Supports compound branch + commit + push)
     if is_branch_creation(transcript):
         bname = extract_branch_name(transcript)
+        has_commit = any(w in t for w in ["commit", "commit all", "commit and push", "push and commit", "push changes", "commit changes", "save changes", "add changes", "with all changes", "and commit"])
+        if has_commit:
+            return {
+                "type": "git_action",
+                "action": "create_branch_and_commit",
+                "target_file": "",
+                "task_description": f"Create branch {bname}, stage, commit, and push all changes",
+                "command": (
+                    f'{cd_prefix} && (git checkout -b {bname} 2>nul || git checkout {bname}) && '
+                    f'git add -A && (git commit -m "Automated update via Jarvis on {bname}" || echo "No changes to commit") && '
+                    f'git push -u origin {bname}'
+                ),
+                "speaking_start": f"Creating branch {bname}, committing all changes, and pushing to GitHub, sir.",
+                "speaking_progress": "",
+                "speaking_response": f"Branch {bname} has been created with all changes committed and pushed to GitHub, sir.",
+            }
         return {
             "type": "git_action",
             "action": "create_branch",
