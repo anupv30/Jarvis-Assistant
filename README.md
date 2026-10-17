@@ -105,6 +105,3 @@ jarvis status
 # 3. Start Zero-Latency Voice Listener
 .\start_jarvis.bat
 ```
-
-> **Test Note:** This is a temporary test sentence to verify code edit reverting.
-
