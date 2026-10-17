@@ -177,11 +177,21 @@ def is_revert_action(transcript: str) -> bool:
         "rollback the last commit", "rollback last commit", "rollback commit"
     ]) or bool(re.search(r'^(?:please\s+|jarvis\s+)?(?:revert|undo|rollback)\b', t))
 
+def is_discard_intent(transcript: str) -> bool:
+    """Detects command to discard uncommitted working tree changes."""
+    t = transcript.lower()
+    return any(k in t for k in [
+        "discard uncommitted", "discard changes", "discard local changes",
+        "undo uncommitted", "reset uncommitted", "wipe uncommitted",
+        "clean working tree", "revert uncommitted", "restore modified files",
+        "discard my changes"
+    ])
+
 def is_git_query(transcript: str) -> bool:
     """Detects informational git questions (NOT action commands).
     Examples: 'what branch am I on?', 'which branch am I in?', 'show me git status'
     """
-    if is_revert_action(transcript):
+    if is_revert_action(transcript) or is_discard_intent(transcript):
         return False
     t = transcript.lower()
     # Question patterns about git state
@@ -624,7 +634,20 @@ def build_default_intent(transcript: str) -> dict:
             "speaking_response": "The last committed changes have been reverted and synced with GitHub, sir.",
         }
 
-    # 2. Antigravity Coding, Bug Fixing, App Creation, HUD & Theme Intent
+    # 2. Discard Uncommitted Changes Intent
+    if is_discard_intent(transcript):
+        return {
+            "type": "git_action",
+            "action": "discard_uncommitted",
+            "target_file": "",
+            "task_description": "Discard uncommitted local changes",
+            "command": f'{cd_prefix} && git restore . && git clean -fd',
+            "speaking_start": "Discarding all uncommitted local modifications, sir.",
+            "speaking_progress": "Resetting working tree...",
+            "speaking_response": "All uncommitted local changes have been discarded, sir.",
+        }
+
+    # 3. Antigravity Coding, Bug Fixing, App Creation, HUD & Theme Intent
     if is_antigravity_intent(transcript):
         target_file = extract_target_file(transcript)
         target_path = os.path.join(target_repo, target_file)
@@ -1002,7 +1025,11 @@ def route_intent(transcript: str) -> dict:
     if is_revert_action(cleaned):
         return build_default_intent(cleaned)
 
-    # 2. IMMEDIATE ROUTING: Git informational queries
+    # 2. IMMEDIATE ROUTING: Discard uncommitted changes action
+    if is_discard_intent(cleaned):
+        return build_default_intent(cleaned)
+
+    # 3. IMMEDIATE ROUTING: Git informational queries
     if is_git_query(cleaned):
         return build_default_intent(cleaned)
 

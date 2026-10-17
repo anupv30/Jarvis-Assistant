@@ -471,7 +471,16 @@ def main():
                 f.write(f"[GIT SUCCESS] {data.get('speaking_response', 'The last committed changes have been reverted successfully, sir.')}")
             sys.exit(0)
 
-    # 5. Dedicated Handler for Commit & Push
+    # 5. Dedicated Handler for Discarding Uncommitted Changes
+    elif action in ["discard_uncommitted", "discard_changes"] or "discard uncommitted" in command.lower() or "discard uncommitted" in task_desc or "discard changes" in task_desc or "discard local changes" in task_desc:
+        print(f"[Jarvis Executing]: Discarding Uncommitted Changes in '{target_repo}'")
+        subprocess.run(["git", "restore", "."], cwd=target_repo, capture_output=True)
+        subprocess.run(["git", "clean", "-fd"], cwd=target_repo, capture_output=True)
+        with open(status_file, "w", encoding="utf-8") as f:
+            f.write(f"[GIT SUCCESS] {data.get('speaking_response', 'All uncommitted local changes have been discarded, sir.')}")
+        sys.exit(0)
+
+    # 6. Dedicated Handler for Commit & Push
     elif "push" in command or "push" in task_desc or "commit" in task_desc:
         print(f"[Jarvis Executing]: Robust Git Commit & Push in '{target_repo}'")
         retcode, out_msg = handle_commit_and_push(target_repo)
