@@ -58,11 +58,12 @@ FORMAT = AUDIO_FORMAT_INT16
 CHANNELS = 1
 
 # VAD Parameters
-SILENCE_TIMEOUT_MS = 650  # 650ms natural silence cutoff for complete command recognition
-MIN_SPEECH_CHUNKS = 4     # ~320ms minimum speech
-MAX_RECORDING_SEC = 12    # Safety cap
-VAD_SPEECH_THRESHOLD = 0.32
-RMS_ENERGY_THRESHOLD = 200.0
+SILENCE_TIMEOUT_MS = 1200  # 1200ms natural conversational pause tolerance (no premature cutting)
+MIN_SPEECH_CHUNKS = 6      # Require ~480ms speech before silence checks
+MIN_RECORDING_SEC = 2.5    # Minimum 2.5s recording window so full queries are always captured
+MAX_RECORDING_SEC = 14     # Generous safety cap for complex commands
+VAD_SPEECH_THRESHOLD = 0.28# High sensitivity for natural voices
+RMS_ENERGY_THRESHOLD = 150.0# Low energy floor for quiet microphones
 
 def launch_hud_interface():
     """Seamlessly launches the Jarvis Sci-Fi HUD in a non-blocking background subprocess."""
@@ -82,9 +83,18 @@ def play_instant_wake_acknowledgment():
         except Exception as e:
             print(f"[Jarvis] Local wake playback notice: {e}", file=sys.stderr)
 
-def record_dynamic_command(stream: pyaudio.Stream, vad_engine) -> bytes:
-    """Dynamically records microphone audio until 350ms of trailing silence."""
-    print("[Jarvis] Streaming audio: dynamic VAD active (350ms silence cutoff)...")
+def record_dynamic_command(stream, vad_engine) -> bytes:
+    """Dynamically records microphone audio with intelligent pause tolerance and complete query capture."""
+    # Flush any stale buffer accumulated during wake word playback
+    if stream:
+        try:
+            available = stream.get_read_available()
+            if available > 0:
+                stream.read(available, exception_on_overflow=False)
+        except Exception:
+            pass
+
+    print("[Jarvis] Listening to command (speak naturally, 1.2s pause tolerance)...")
     frames = []
     has_spoken = False
     speech_chunks_count = 0
@@ -105,24 +115,38 @@ def record_dynamic_command(stream: pyaudio.Stream, vad_engine) -> bytes:
         rms = np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2))
         is_speech = (speech_prob >= VAD_SPEECH_THRESHOLD) or (rms >= RMS_ENERGY_THRESHOLD)
 
+        elapsed = time.time() - start_time
+
         if is_speech:
             has_spoken = True
             speech_chunks_count += 1
             silence_duration_ms = 0
         else:
-            if has_spoken and speech_chunks_count >= MIN_SPEECH_CHUNKS:
+            # Only trigger silence cutoff if user has spoken AND recorded for at least MIN_RECORDING_SEC
+            if has_spoken and speech_chunks_count >= MIN_SPEECH_CHUNKS and elapsed >= MIN_RECORDING_SEC:
                 silence_duration_ms += 80
                 if silence_duration_ms >= SILENCE_TIMEOUT_MS:
-                    print(f"[Jarvis] End-of-speech detected ({silence_duration_ms}ms silence). Stopping capture.")
+                    print(f"[Jarvis] End-of-speech detected ({silence_duration_ms}ms pause, {elapsed:.1f}s total).")
                     break
 
-        if time.time() - start_time > MAX_RECORDING_SEC:
+        if elapsed > MAX_RECORDING_SEC:
             print("[Jarvis] Maximum recording safety timeout reached.")
             break
 
     return b"".join(frames)
 
 def save_wav(raw_bytes: bytes, audio, filepath: str):
+    """Saves WAV audio with peak amplitude normalization for maximum Whisper accuracy."""
+    try:
+        samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
+        max_val = np.max(np.abs(samples))
+        if max_val > 50:
+            gain = (32767.0 * 0.90) / max_val
+            samples = np.clip(samples * min(gain, 4.0), -32768, 32767).astype(np.int16)
+            raw_bytes = samples.tobytes()
+    except Exception:
+        pass
+
     with wave.open(filepath, "wb") as wf:
         wf.setnchannels(CHANNELS)
         sampwidth = audio.get_sample_size(FORMAT) if (audio and hasattr(audio, "get_sample_size")) else 2
@@ -243,15 +267,31 @@ def process_transcript_pipeline(transcript: str, play_tts: bool = True, source: 
             result_payload["response"] = err_phrase
 
     elif itype == "antigravity_task":
-        start_phrase = spk_start or "On it, sir. Delegating task to Antigravity Agent."
+        start_phrase = spk_start or "On it, sir. Repairing code errors with Ollama offline."
         print(f"[Jarvis Pipeline] Announcing start: {start_phrase}")
         if play_tts:
             subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), start_phrase], cwd=PROJECT_ROOT)
 
-        print("[Jarvis Pipeline] Executing Antigravity Agent Bridge...")
-        subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "execute_agent.py")], cwd=PROJECT_ROOT)
+        print("[Jarvis Pipeline] Executing Autonomous Code Repair Bridge (Ollama Offline)...")
+        agent_proc = subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "execute_agent.py")], cwd=PROJECT_ROOT)
 
         done_phrase = spk_resp or "Task completed, sir."
+        try:
+            status_path = os.path.join(PROJECT_ROOT, "last_status.txt")
+            if os.path.exists(status_path):
+                with open(status_path, "r", encoding="utf-8") as sf:
+                    st = sf.read().strip()
+                    if "[OLLAMA SUCCESS]" in st:
+                        done_phrase = st.replace("[OLLAMA SUCCESS]", "").strip()
+                    elif "[OLLAMA NOTICE]" in st:
+                        done_phrase = st.replace("[OLLAMA NOTICE]", "").strip()
+                    elif "[OLLAMA ERROR]" in st:
+                        done_phrase = st.replace("[OLLAMA ERROR]", "").strip()
+                    elif st and not st.startswith("["):
+                        done_phrase = st
+        except Exception:
+            pass
+
         print(f"[Jarvis Pipeline] Announcing completion: {done_phrase}")
         if play_tts:
             subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), done_phrase], cwd=PROJECT_ROOT)

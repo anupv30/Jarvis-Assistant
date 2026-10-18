@@ -410,9 +410,16 @@ def extract_branch_name(transcript: str) -> str:
     return sanitized if sanitized else "feature-branch"
 
 def check_python_syntax(filepath: str) -> tuple[bool, str, int | None, str]:
-    """Runs actual `python -m py_compile <filepath>` to capture real compilation status."""
+    """Runs comprehensive AST, compilation, and runtime diagnostics."""
     if not filepath or not os.path.exists(filepath):
         return True, "File does not exist yet", None, ""
+
+    try:
+        from execute_agent import diagnose_file
+        valid, diag_msg, line_num = diagnose_file(filepath)
+        return valid, diag_msg, line_num, diag_msg
+    except Exception:
+        pass
 
     try:
         proc = subprocess.run(
@@ -432,34 +439,47 @@ def check_python_syntax(filepath: str) -> tuple[bool, str, int | None, str]:
 
         lines = [l.strip() for l in err_output.splitlines() if l.strip()]
         error_line = lines[-1] if lines else "SyntaxError: compilation failure"
-        offending_code = ""
-        for i, l in enumerate(lines):
-            if "line " in l.lower() and i + 1 < len(lines):
-                offending_code = lines[i + 1]
-                break
-
-        if offending_code:
-            error_details = f"{error_line}: {offending_code}"
-        else:
-            error_details = error_line
-
-        return False, err_output, line_num, error_details
+        return False, err_output, line_num, error_line
     except Exception as e:
         return False, str(e), None, str(e)
 
 def extract_target_file(transcript: str) -> str:
-    """Extracts target python filename from transcript or matches known codebase files."""
+    """Extracts target python filename from transcript or returns empty string for project-wide repair."""
+    t = transcript.lower()
+
+    # If transcript is generic (e.g. "in the project", "in the program", "all errors", "any errors"), return empty string for full project scan
+    if any(phrase in t for phrase in ["in the project", "in the program", "in project", "in program", "across the project", "all errors", "any errors", "the project", "the program", "in the code"]):
+        return ""
+
+    # 1. Direct regex for filename.py
     m = re.search(r'([a-zA-Z0-9_\-]+\.py)', transcript, re.IGNORECASE)
     if m:
         return m.group(1).lower()
+
+    # 2. Phonetic "filename dot py" or "filename pi"
+    m_phonetic = re.search(r'([a-zA-Z0-9_\-]+)\s+(?:dot|\.)\s*(?:py|pi)\b', transcript, re.IGNORECASE)
+    if m_phonetic:
+        return f"{m_phonetic.group(1).lower()}.py"
+
+    target_repo = get_target_repo()
+
+    # 3. Match any existing .py file in target_repo if its base name specifically appears in speech (e.g. "fix multiply")
+    try:
+        if os.path.exists(target_repo):
+            for f in os.listdir(target_repo):
+                if f.endswith(".py"):
+                    base = os.path.splitext(f)[0].lower()
+                    if len(base) > 2 and re.search(r'\b' + re.escape(base) + r'\b', t):
+                        return f
+    except Exception:
+        pass
 
     known_files = [
         "jarvis_listener", "speak", "transcribe", "intent_router",
         "jarvis_hud", "execute_git", "execute_agent", "start_hud", "start_jarvis"
     ]
-    t = transcript.lower()
     for kf in known_files:
-        if kf in t:
+        if re.search(r'\b' + re.escape(kf) + r'\b', t):
             return f"{kf}.py"
 
     if any(w in t for w in ["hud", "gui", "theme", "dashboard"]):
@@ -467,7 +487,8 @@ def extract_target_file(transcript: str) -> str:
 
     if any(w in t for w in ["generate", "create", "write", "build", "new script", "create app"]):
         return "custom_tool.py"
-    return "jarvis_listener.py"
+
+    return ""
 
 def build_system_prompt() -> str:
     target_repo = get_target_repo()
@@ -797,25 +818,48 @@ def build_default_intent(transcript: str) -> dict:
     # 3. Antigravity Coding, Bug Fixing, App Creation, HUD & Theme Intent
     if is_antigravity_intent(transcript):
         target_file = extract_target_file(transcript)
-        target_path = os.path.join(target_repo, target_file)
 
-        valid, full_tb, line_num, err_details = check_python_syntax(target_path)
+        if not target_file:
+            # Dynamic Project-Wide Scan and Repair
+            return {
+                "type": "antigravity_task",
+                "action": "bug_fix",
+                "target_file": "",
+                "task_description": transcript,
+                "command": f'{cd_prefix} && python execute_agent.py antigravity_task.json',
+                "speaking_start": "Scanning all Python files across the project for errors with Ollama offline, sir.",
+                "speaking_progress": "Ollama is scanning and repairing project files offline...",
+                "speaking_response": "Project scan complete. All identified errors have been resolved with Ollama, sir.",
+            }
+
+        target_path = os.path.join(target_repo, target_file)
+        valid, diag_err, line_num, _ = check_python_syntax(target_path)
         if not valid:
             action = "bug_fix"
             if line_num:
-                speaking_response = f"Syntax error detected on line {line_num} in {target_file}. Dispatched fix prompt directly to Antigravity, sir."
-                task_desc = f"@{target_file} Fix the compilation error on line {line_num}: {err_details}. Resolve this issue now."
+                speaking_start = f"Error detected on line {line_num} in {target_file}. Repairing with Ollama offline, sir."
+                task_desc = f"@{target_file} Fix the error on line {line_num}: {diag_err}. Resolve this issue now."
             else:
-                speaking_response = f"Syntax error detected in {target_file}. Dispatched fix prompt directly to Antigravity, sir."
-                task_desc = f"@{target_file} Fix the compilation error: {err_details}. Resolve this issue now."
+                speaking_start = f"Error detected in {target_file}. Repairing with Ollama offline, sir."
+                task_desc = f"@{target_file} Fix the error: {diag_err}. Resolve this issue now."
+            speaking_progress = f"Ollama is analyzing and repairing {target_file}..."
+            speaking_response = f"I have repaired the error in {target_file} using Ollama, sir. Verification is valid."
         else:
             if "refactor" in t:
                 action = "refactor"
+                speaking_start = f"Refactoring {target_file} with Ollama, sir."
+                speaking_progress = f"Ollama is refactoring {target_file}..."
+                speaking_response = f"Refactoring completed for {target_file}, sir."
             elif any(w in t for w in ["generate", "create", "write", "make", "build", "create app"]):
                 action = "code_generation"
+                speaking_start = f"Synthesizing new module {target_file} with Ollama, sir."
+                speaking_progress = f"Ollama is generating code for {target_file}..."
+                speaking_response = f"Module {target_file} generated successfully, sir."
             else:
                 action = "bug_fix"
-            speaking_response = f"Syntax check passed. No compilation errors found in {target_file}, sir."
+                speaking_start = f"Inspecting {target_file} with Ollama offline, sir."
+                speaking_progress = f"Ollama is checking {target_file}..."
+                speaking_response = f"Diagnostic check passed. No compilation or runtime errors found in {target_file}, sir."
             task_desc = transcript
 
         return {
@@ -824,8 +868,8 @@ def build_default_intent(transcript: str) -> dict:
             "target_file": target_file,
             "task_description": task_desc,
             "command": f'{cd_prefix} && python execute_agent.py antigravity_task.json',
-            "speaking_start": "Delegating task to Antigravity Agent, sir.",
-            "speaking_progress": f"Antigravity is checking {target_file}...",
+            "speaking_start": speaking_start,
+            "speaking_progress": speaking_progress,
             "speaking_response": speaking_response,
         }
 
@@ -1050,24 +1094,28 @@ def sanitize_json(raw_text: str, transcript: str) -> dict:
 
     if req_type == "antigravity_task":
         action = str(data.get("action", "bug_fix")).strip() or "bug_fix"
-        target_path = os.path.join(PROJECT_ROOT, target_file)
+        target_path = os.path.join(get_target_repo(), target_file)
         valid, full_tb, line_num, err_details = check_python_syntax(target_path)
         if not valid:
             action = "bug_fix"
             if line_num:
-                speaking_resp = f"Syntax error detected on line {line_num} in {target_file}. Dispatched fix prompt directly to Antigravity, sir."
+                start = f"Syntax error detected on line {line_num} in {target_file}. Repairing with Ollama offline, sir."
                 task_desc = f"@{target_file} Fix the compilation error on line {line_num}: {err_details}. Resolve this issue now."
             else:
-                speaking_resp = f"Syntax error detected in {target_file}. Dispatched fix prompt directly to Antigravity, sir."
+                start = f"Syntax error detected in {target_file}. Repairing with Ollama offline, sir."
                 task_desc = f"@{target_file} Fix the compilation error: {err_details}. Resolve this issue now."
+            prog = f"Ollama is repairing {target_file} offline..."
+            speaking_resp = f"I have repaired the error in {target_file} using Ollama, sir. Syntax is valid."
         elif not speaking_resp or speaking_resp.startswith("Task completed"):
+            start = f"Checking syntax for {target_file}, sir."
+            prog = f"Ollama is checking {target_file}..."
             speaking_resp = f"Syntax check passed. No compilation errors found in {target_file}, sir."
             task_desc = str(data.get("task_description", transcript)).strip()
         else:
+            start = f"Analyzing {target_file} with Ollama offline, sir."
+            prog = clean_spoken_text(str(data.get("speaking_progress", f"Ollama is checking {target_file}...")))
             task_desc = str(data.get("task_description", transcript)).strip()
 
-        start = "Delegating task to Antigravity Agent, sir."
-        prog = clean_spoken_text(str(data.get("speaking_progress", f"Antigravity is checking {target_file}...")))
         if not cmd:
             cmd = f'{cd_prefix} && python execute_agent.py antigravity_task.json'
         elif not cmd.startswith("cd "):
@@ -1330,39 +1378,19 @@ def main():
         action = result.get("action", "bug_fix")
         target_f = result.get("target_file", "")
         task_desc = result.get("task_description", transcript)
-        target_path = os.path.join(PROJECT_ROOT, target_f) if target_f else ""
+        target_path = os.path.join(get_target_repo(), target_f) if target_f else ""
 
-        valid, full_tb, line_num, err_details = check_python_syntax(target_path)
-        if not valid:
-            if line_num:
-                formatted_prompt = f"@{target_f} Fix the compilation error on line {line_num}: {err_details}. Resolve this issue now."
-                result["speaking_response"] = f"Syntax error detected on line {line_num} in {target_f}. Dispatched fix prompt directly to Antigravity, sir."
-            else:
-                formatted_prompt = f"@{target_f} Fix the compilation error: {err_details}. Resolve this issue now."
-                result["speaking_response"] = f"Syntax error detected in {target_f}. Dispatched fix prompt directly to Antigravity, sir."
-            hud_status = f"[SYNTAX ERROR] Line {line_num} in {target_f}: {err_details}"
+        if not target_f:
+            formatted_prompt = f"Scan all files across workspace {get_target_repo()} and fix any code errors with Ollama."
+            hud_status = "[OLLAMA] Scanning workspace for code defects..."
         else:
-            if str(task_desc).startswith("@"):
-                formatted_prompt = task_desc
+            valid, diag_err, line_num, _ = check_python_syntax(target_path)
+            if not valid:
+                formatted_prompt = f"@{target_f} Fix the error on line {line_num or '?'}: {diag_err}. Resolve this issue now."
+                hud_status = f"[DEFECT DETECTED] Line {line_num or '?'} in {target_f}: {diag_err[:80]}"
             else:
-                formatted_prompt = f"""================================================================================
-                    ANTIGRAVITY AUTONOMOUS TASK DISPATCH
-================================================================================
-ACTION      : {action.upper()}
-TARGET FILE : {target_f}
-TIMESTAMP   : {time.strftime('%Y-%m-%d %H:%M:%S')}
-WORKSPACE   : {PROJECT_ROOT}
-
-TASK SPECIFICATION:
-{task_desc}
-
-DIRECTIVE:
-1. Inspect {target_f} and project workspace context.
-2. Execute requested code changes, bug fix, or feature scaffolding.
-3. Verify syntax and report status.
-================================================================================
-"""
-            hud_status = f"[SYNTAX OK] No compilation errors found in {target_f}."
+                formatted_prompt = f"@{target_f} {task_desc}"
+                hud_status = f"[DIAGNOSTIC OK] No errors found in {target_f}."
 
         try:
             with open(ANTIGRAVITY_PROMPT_FILE, "w", encoding="utf-8") as f:
@@ -1371,14 +1399,7 @@ DIRECTIVE:
         except Exception as e:
             print(f"[intent_router.py] Antigravity prompt caching notice: {e}", file=sys.stderr)
 
-        # Automatically dispatch to Antigravity IDE agent (Ctrl+L -> Ctrl+V -> Enter)
-        dispatched_ok = False
-        try:
-            from antigravity_bridge import dispatch_prompt_to_antigravity
-            dispatched_ok = dispatch_prompt_to_antigravity(formatted_prompt)
-        except Exception as e:
-            print(f"[intent_router.py] Antigravity direct dispatch error: {e}", file=sys.stderr)
-            sync_to_clipboard(formatted_prompt)
+        dispatched_ok = True
 
         # Stream update to last_status.txt for HUD Panel 3
         try:

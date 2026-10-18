@@ -1,0 +1,6 @@
+def multiply(a, b):
+    result = a * b
+    return "Result is: " + str(result)
+
+if __name__ == "__main__":
+    print(multiply(3, 4))

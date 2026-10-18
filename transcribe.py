@@ -2,7 +2,7 @@
 """
 Jarvis Speech-to-Text Transcription Module
 Primary Engine: Groq Cloud API (whisper-large-v3-turbo) for ultra-fast sub-100ms transcription.
-Offline Fallback: Local faster-whisper (tiny.en, int8 quantization).
+Offline Fallback: Local faster-whisper (base.en, int8 quantization with model caching).
 Saves last transcript to `last_transcript.txt` for rock-solid workflow pipeline safety.
 """
 
@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 # Suppress HuggingFace hub symlink warnings on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 warnings.filterwarnings("ignore")
 
 load_dotenv()
@@ -23,9 +24,11 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 TRANSCRIPT_CACHE_FILE = os.path.join(PROJECT_ROOT, "last_transcript.txt")
 
 WHISPER_PROMPT = (
-    "Jarvis developer assistant: git commit, git status, git push, git branch, git checkout, "
-    "git pull, git revert, git diff, git stash, GitHub, create repository, merge, stage, codebase, "
-    "checkout main, switch branch, commit changes."
+    "Jarvis developer assistant: rectify, fix errors, bug fix, solve, error, syntax error, "
+    "compilation error, runtime exception, multiply.py, script, compile, offline, "
+    "git commit, git status, git push, git branch, git checkout, git pull, git revert, "
+    "git diff, git stash, GitHub, create repository, merge, stage, codebase, "
+    "checkout main, switch branch, commit changes, Ollama, Python."
 )
 
 def sanitize_transcript(text: str) -> str:
@@ -39,7 +42,7 @@ def sanitize_transcript(text: str) -> str:
     cleaned = re.sub(r"^(?:hey\s+)?jarvis[\s,\.\!:]*", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"^(?:please\s+|could\s+you\s+|can\s+you\s+)", "", cleaned, flags=re.IGNORECASE).strip()
 
-    # Correct common ASR misrecognitions for developer and Git terms
+    # Correct common ASR misrecognitions for developer, Git, and code terms
     substitutions = [
         (r"\bget\s+(status|commit|push|pull|branch|checkout|diff|log|stash|revert|remote|init|fetch|merge)\b", r"git \1"),
         (r"\b(?:did|kid|good|give)\s+(status|commit|push|pull|branch|checkout|diff)\b", r"git \1"),
@@ -49,11 +52,19 @@ def sanitize_transcript(text: str) -> str:
         (r"\bcoma\s+message\b", "commit message"),
         (r"\bcoma\b", "commit"),
         (r"\bstash\s+pop\b", "stash pop"),
+        (r"\b(?:obama|allama|olama)\b", "ollama"),
+        (r"\b(?:electify|ratify|rectifly|rectiphy)\b", "rectify"),
+        (r"\bdot\s+py\b", ".py"),
+        (r"\bdot\s+pi\b", ".py"),
+        (r"\bdot\s+p\s+by\s+phi\b", ".py"),
+        (r"\bmultiply\s+(?:dot\s+py|\.py|pi|by\s+phi)\b", "multiply.py"),
+        (r"\bmultiple\.py\b", "multiply.py"),
     ]
     for pattern, replacement in substitutions:
         cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
 
-    return cleaned.strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 def transcribe_with_groq(audio_path: str) -> str:
     """Primary ASR: Groq Cloud API whisper-large-v3 with developer vocabulary prompt bias."""
@@ -65,7 +76,6 @@ def transcribe_with_groq(audio_path: str) -> str:
         "Authorization": f"Bearer {GROQ_API_KEY}",
     }
 
-    # Try whisper-large-v3 first (highest accuracy), then turbo
     models_to_try = ["whisper-large-v3", "whisper-large-v3-turbo"]
     last_err = None
 
@@ -95,16 +105,27 @@ def transcribe_with_groq(audio_path: str) -> str:
 
     raise RuntimeError(f"Groq Whisper failed: {last_err}")
 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+_cached_whisper_model = None
+
+def get_faster_whisper_model():
+    """Returns singleton cached WhisperModel instance to eliminate reload latency."""
+    global _cached_whisper_model
+    if _cached_whisper_model is None:
+        from faster_whisper import WhisperModel
+        model_name = os.getenv("WHISPER_MODEL", "base.en")
+        try:
+            _cached_whisper_model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        except Exception:
+            _cached_whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    return _cached_whisper_model
 
 def transcribe_with_faster_whisper(audio_path: str) -> str:
-    """Offline Fallback ASR: Local faster-whisper tiny.en with direct WAV numpy ingestion."""
+    """Offline Fallback ASR: Local faster-whisper base.en with direct WAV numpy ingestion."""
     try:
-        from faster_whisper import WhisperModel
         import wave
         import numpy as np
     except ImportError:
-        raise RuntimeError("faster-whisper or numpy is not installed in local environment.")
+        raise RuntimeError("numpy is not installed in local environment.")
 
     # Convert WAV to float32 numpy array to bypass PyAV container issues
     audio_input = audio_path
@@ -126,13 +147,15 @@ def transcribe_with_faster_whisper(audio_path: str) -> str:
     except Exception:
         audio_input = audio_path
 
-    model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    model = get_faster_whisper_model()
     segments, _ = model.transcribe(
         audio_input,
         beam_size=5,
+        best_of=5,
         vad_filter=True,
         initial_prompt=WHISPER_PROMPT,
         vad_parameters=dict(min_silence_duration_ms=400),
+        condition_on_previous_text=False,
     )
     text_parts = [segment.text.strip() for segment in segments]
     return sanitize_transcript(" ".join(text_parts))
@@ -156,7 +179,7 @@ def transcribe(audio_path: str) -> str:
         except Exception as e:
             print(f"[transcribe.py] Groq Whisper notice ({e}), falling back to offline faster-whisper...", file=sys.stderr)
 
-    # 2. Offline Fallback: Local faster-whisper
+    # 2. Offline Fallback: Local faster-whisper base.en
     try:
         return transcribe_with_faster_whisper(audio_path)
     except Exception as e:
@@ -180,7 +203,6 @@ def main():
 
     # Output to stdout
     print(transcript)
-    sys.exit(0)
 
 if __name__ == "__main__":
     main()
