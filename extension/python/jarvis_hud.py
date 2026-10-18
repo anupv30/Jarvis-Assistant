@@ -64,6 +64,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QTextEdit,
     QFrame,
+    QLineEdit,
+    QPushButton,
 )
 
 from jarvis_config import (
@@ -518,11 +520,83 @@ class JarvisHUD(QMainWindow):
 
         main_layout.addLayout(grid)
 
+        # 6. Cybernetic Command Input Bar (Interactive Text Mode)
+        self.panel_input = SciFiFrame("CYBER COMMAND INPUT (TEXT MODE)")
+        input_layout = QHBoxLayout(self.panel_input)
+        input_layout.setContentsMargins(12, 28, 12, 10)
+        input_layout.setSpacing(10)
+
+        self.cmd_prompt_lbl = QLabel("COMMAND >")
+        self.cmd_prompt_lbl.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        self.cmd_prompt_lbl.setStyleSheet("color: #00e1ff; padding: 2px;")
+        input_layout.addWidget(self.cmd_prompt_lbl)
+
+        self.txt_input = QLineEdit()
+        self.txt_input.setPlaceholderText("Type voice/git command or query here and press Enter (e.g. 'commit changes', 'what is git status')...")
+        self.txt_input.setFont(QFont("Consolas", 10))
+        self.txt_input.setStyleSheet("""
+            QLineEdit {
+                background: rgba(11, 14, 35, 230);
+                color: #00ff88;
+                border: 1px solid rgba(0, 225, 255, 140);
+                border-radius: 3px;
+                padding: 6px 10px;
+                selection-background-color: #00e1ff;
+            }
+            QLineEdit:focus {
+                border: 1px solid #00e1ff;
+                background: rgba(14, 18, 48, 255);
+            }
+        """)
+        self.txt_input.returnPressed.connect(self.on_transmit_command)
+        input_layout.addWidget(self.txt_input)
+
+        self.btn_transmit = QPushButton("TRANSMIT")
+        self.btn_transmit.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        self.btn_transmit.setStyleSheet("""
+            QPushButton {
+                background: rgba(0, 225, 255, 30);
+                color: #00e1ff;
+                border: 1px solid #00e1ff;
+                border-radius: 3px;
+                padding: 6px 18px;
+            }
+            QPushButton:hover {
+                background: rgba(0, 225, 255, 80);
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background: rgba(0, 255, 136, 120);
+                color: #ffffff;
+            }
+        """)
+        self.btn_transmit.clicked.connect(self.on_transmit_command)
+        input_layout.addWidget(self.btn_transmit)
+
+        main_layout.addWidget(self.panel_input)
+
         # Initial console greeting
         self.log_console("SYSTEM BOOT COMPLETED: Jarvis HUD Initialized.")
         self.log_console(f"ACTIVE WORKSPACE: {self.target_repo}")
         self.log_console(f"ACTIVE GIT BRANCH: {self.current_branch}")
         self.log_console(f"N8N AUTOMATION: {'ONLINE (http://localhost:5678)' if self.n8n_online else 'STANDBY'}")
+
+    def on_transmit_command(self):
+        text = self.txt_input.text().strip()
+        if not text:
+            return
+        self.txt_input.clear()
+        self.log_console(f"TRANSMIT COMMAND: {text}", color="#00e1ff")
+        self.lbl_transcript.setText(f"USER [TEXT] > \"{text}\"")
+
+        import threading
+        def _worker():
+            try:
+                from jarvis_listener import process_transcript_pipeline
+                process_transcript_pipeline(text, play_tts=True, source="text")
+            except Exception as e:
+                print(f"[HUD] Text execution error: {e}", file=sys.stderr)
+        threading.Thread(target=_worker, daemon=True).start()
 
     def log_console(self, msg: str, color: str = "#00ff88"):
         timestamp = time.strftime("[%H:%M:%S]")

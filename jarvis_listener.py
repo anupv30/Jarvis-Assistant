@@ -16,7 +16,12 @@ import subprocess
 import wave
 import requests
 import numpy as np
-import pyaudio
+try:
+    import pyaudio
+    AUDIO_FORMAT_INT16 = pyaudio.paInt16
+except Exception:
+    pyaudio = None
+    AUDIO_FORMAT_INT16 = 2
 import pygame
 import threading
 import json
@@ -49,15 +54,15 @@ ON_IT_AUDIO = os.path.join(PROJECT_ROOT, "on_it.mp3")
 THRESHOLD = 0.20
 RATE = 16000
 CHUNK = 1280  # 80ms chunks
-FORMAT = pyaudio.paInt16
+FORMAT = AUDIO_FORMAT_INT16
 CHANNELS = 1
 
 # VAD Parameters
-SILENCE_TIMEOUT_MS = 350  # 350ms silence cutoff
-MIN_SPEECH_CHUNKS = 3     # ~240ms minimum speech
-MAX_RECORDING_SEC = 10    # Safety cap
-VAD_SPEECH_THRESHOLD = 0.35
-RMS_ENERGY_THRESHOLD = 250.0
+SILENCE_TIMEOUT_MS = 650  # 650ms natural silence cutoff for complete command recognition
+MIN_SPEECH_CHUNKS = 4     # ~320ms minimum speech
+MAX_RECORDING_SEC = 12    # Safety cap
+VAD_SPEECH_THRESHOLD = 0.32
+RMS_ENERGY_THRESHOLD = 200.0
 
 def launch_hud_interface():
     """Seamlessly launches the Jarvis Sci-Fi HUD in a non-blocking background subprocess."""
@@ -117,10 +122,11 @@ def record_dynamic_command(stream: pyaudio.Stream, vad_engine) -> bytes:
 
     return b"".join(frames)
 
-def save_wav(raw_bytes: bytes, audio: pyaudio.PyAudio, filepath: str):
+def save_wav(raw_bytes: bytes, audio, filepath: str):
     with wave.open(filepath, "wb") as wf:
         wf.setnchannels(CHANNELS)
-        wf.setsampwidth(audio.get_sample_size(FORMAT))
+        sampwidth = audio.get_sample_size(FORMAT) if (audio and hasattr(audio, "get_sample_size")) else 2
+        wf.setsampwidth(sampwidth)
         wf.setframerate(RATE)
         wf.writeframes(raw_bytes)
 
@@ -136,22 +142,142 @@ def dispatch_to_n8n(audio_path: str):
     except Exception:
         pass
 
+def process_transcript_pipeline(transcript: str, play_tts: bool = True, source: str = "voice") -> dict:
+    """
+    Unified execution pipeline for both voice and text inputs:
+    1. Updates last_transcript.txt (HUD updates immediately)
+    2. Routes intent dynamically with Groq LLM -> Local Ollama fallback -> Deterministic fallback
+    3. Speaks task acknowledgment (if play_tts=True)
+    4. Executes Git CLI operation or Antigravity task
+    5. Updates last_status.txt
+    6. Speaks completion or answers question (if play_tts=True)
+    """
+    clean_text = transcript.strip()
+    if not clean_text:
+        return {"status": "error", "message": "Empty query"}
+
+    print(f"\n[Jarvis Pipeline] [{source.upper()}] Processing: \"{clean_text}\"")
+
+    # Step 1: Update transcript cache for HUD & downstream tools
+    transcript_file = os.path.join(PROJECT_ROOT, "last_transcript.txt")
+    try:
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            f.write(clean_text)
+    except Exception:
+        pass
+
+    # Step 2: Route intent dynamically (Groq -> Ollama -> Deterministic)
+    print(f"[Jarvis Pipeline] Routing intent for: \"{clean_text}\"...")
+    subprocess.run(
+        [sys.executable, os.path.join(PROJECT_ROOT, "intent_router.py"), clean_text],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True
+    )
+
+    intent_file = os.path.join(PROJECT_ROOT, "last_intent.json")
+    if not os.path.exists(intent_file):
+        print("[Jarvis Pipeline] Error: last_intent.json not found.", file=sys.stderr)
+        return {"status": "error", "message": "Failed to generate intent."}
+
+    with open(intent_file, "r", encoding="utf-8") as f:
+        intent = json.load(f)
+
+    itype = intent.get("type", "general_qa")
+    spk_start = intent.get("speaking_start", "")
+    spk_resp = intent.get("speaking_response", "")
+
+    result_payload = {"status": "success", "intent": intent, "source": source}
+
+    # Step 3: Handle Action vs QA
+    if itype == "git_query":
+        answer = spk_resp or "Checking git status, sir."
+        print(f"[Jarvis Pipeline] Spoken answer: {answer}")
+        if play_tts:
+            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), answer], cwd=PROJECT_ROOT)
+        result_payload["response"] = answer
+
+    elif itype == "git_action":
+        # Acknowledge task start: "On it, sir..."
+        start_phrase = spk_start or "On it, sir. Committing and pushing your changes."
+        print(f"[Jarvis Pipeline] Announcing start: {start_phrase}")
+        if play_tts:
+            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), start_phrase], cwd=PROJECT_ROOT)
+
+        # Step 4: Execute Git operation
+        print("[Jarvis Pipeline] Executing Git CLI operation...")
+        git_proc = subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "execute_git.py")], cwd=PROJECT_ROOT)
+
+        # Step 5: Announce completion or error
+        if git_proc.returncode == 0:
+            done_phrase = spk_resp or "Task completed successfully, sir."
+            try:
+                status_path = os.path.join(PROJECT_ROOT, "last_status.txt")
+                if os.path.exists(status_path):
+                    with open(status_path, "r", encoding="utf-8") as sf:
+                        st = sf.read().strip()
+                        if "[GIT SUCCESS]" in st:
+                            done_phrase = st.replace("[GIT SUCCESS]", "").strip()
+            except Exception:
+                pass
+            print(f"[Jarvis Pipeline] Announcing completion: {done_phrase}")
+            if play_tts:
+                subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), done_phrase], cwd=PROJECT_ROOT)
+            result_payload["response"] = done_phrase
+        else:
+            err_phrase = "Git operation could not be completed, sir."
+            try:
+                status_path = os.path.join(PROJECT_ROOT, "last_status.txt")
+                if os.path.exists(status_path):
+                    with open(status_path, "r", encoding="utf-8") as sf:
+                        st = sf.read().strip()
+                        if "[GIT ERROR]" in st:
+                            raw_err = st.replace("[GIT ERROR]", "").strip()
+                            err_phrase = f"Git error: {raw_err[:120]}, sir."
+            except Exception:
+                pass
+            print(f"[Jarvis Pipeline] Announcing failure: {err_phrase}")
+            if play_tts:
+                subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), err_phrase], cwd=PROJECT_ROOT)
+            result_payload["status"] = "error"
+            result_payload["response"] = err_phrase
+
+    elif itype == "antigravity_task":
+        start_phrase = spk_start or "On it, sir. Delegating task to Antigravity Agent."
+        print(f"[Jarvis Pipeline] Announcing start: {start_phrase}")
+        if play_tts:
+            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), start_phrase], cwd=PROJECT_ROOT)
+
+        print("[Jarvis Pipeline] Executing Antigravity Agent Bridge...")
+        subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "execute_agent.py")], cwd=PROJECT_ROOT)
+
+        done_phrase = spk_resp or "Task completed, sir."
+        print(f"[Jarvis Pipeline] Announcing completion: {done_phrase}")
+        if play_tts:
+            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), done_phrase], cwd=PROJECT_ROOT)
+        result_payload["response"] = done_phrase
+
+    else:  # general_qa or codebase_qa
+        if spk_resp:
+            print(f"[Jarvis Pipeline] Spoken QA Answer: {spk_resp}")
+            if play_tts:
+                subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), spk_resp], cwd=PROJECT_ROOT)
+            result_payload["response"] = spk_resp
+
+    return result_payload
+
 def run_autonomous_pipeline(audio_path: str):
     """
-    Direct, ultra-responsive autonomous execution pipeline:
-    1. Transcribes audio dynamically with Groq Whisper -> writes to last_transcript.txt (HUD updates immediately!)
-    2. Routes intent dynamically with Groq LLM -> writes to last_intent.json
-    3. Speaks task acknowledgment (e.g. "On it, sir. Committing and pushing changes...")
-    4. Executes validated action (Git command / Antigravity task)
-    5. Speaks completion announcement (e.g. "Task completed successfully, sir." / direct spoken answer)
+    Direct, ultra-responsive autonomous execution pipeline for audio:
+    1. Transcribes audio dynamically with Groq Whisper (with offline faster-whisper fallback)
+    2. Executes unified autonomous pipeline
     """
-    # Avoid duplicate execution: the local autonomous pipeline handles the entire lifecycle
     if os.getenv("DISPATCH_TO_N8N", "false").lower() == "true":
         threading.Thread(target=dispatch_to_n8n, args=(audio_path,), daemon=True).start()
 
     try:
         # Step 1: Transcribe audio
-        print("\n[Jarvis Pipeline] Step 1: Transcribing audio with Groq Whisper...")
+        print("\n[Jarvis Pipeline] Step 1: Transcribing audio...")
         t_proc = subprocess.run(
             [sys.executable, os.path.join(PROJECT_ROOT, "transcribe.py"), audio_path],
             cwd=PROJECT_ROOT,
@@ -164,95 +290,7 @@ def run_autonomous_pipeline(audio_path: str):
             return
 
         print(f"[Jarvis Pipeline] Voice Transcript: \"{transcript}\"")
-        transcript_file = os.path.join(PROJECT_ROOT, "last_transcript.txt")
-        try:
-            with open(transcript_file, "w", encoding="utf-8") as f:
-                f.write(transcript)
-        except Exception:
-            pass
-
-        # Step 2: Route intent dynamically with Groq LLM
-        print("[Jarvis Pipeline] Step 2: Routing intent with Groq LLM...")
-        subprocess.run(
-            [sys.executable, os.path.join(PROJECT_ROOT, "intent_router.py")],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True
-        )
-
-        intent_file = os.path.join(PROJECT_ROOT, "last_intent.json")
-        if not os.path.exists(intent_file):
-            print("[Jarvis Pipeline] Error: last_intent.json not found.", file=sys.stderr)
-            return
-
-        with open(intent_file, "r", encoding="utf-8") as f:
-            intent = json.load(f)
-
-        itype = intent.get("type", "general_qa")
-        spk_start = intent.get("speaking_start", "")
-        spk_resp = intent.get("speaking_response", "")
-
-        # Step 3: Handle Action vs QA
-        if itype == "git_query":
-            answer = spk_resp or "Checking git status, sir."
-            print(f"[Jarvis Pipeline] Speaking answer: {answer}")
-            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), answer], cwd=PROJECT_ROOT)
-
-        elif itype == "git_action":
-            # Acknowledge task start: "On it, sir..."
-            start_phrase = spk_start or "On it, sir. Committing and pushing your changes."
-            print(f"[Jarvis Pipeline] Announcing start: {start_phrase}")
-            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), start_phrase], cwd=PROJECT_ROOT)
-
-            # Step 4: Execute Git operation
-            print("[Jarvis Pipeline] Step 3: Executing Git CLI operation...")
-            git_proc = subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "execute_git.py")], cwd=PROJECT_ROOT)
-
-            # Step 5: Announce completion or error
-            if git_proc.returncode == 0:
-                done_phrase = spk_resp or "Task completed successfully, sir."
-                try:
-                    status_path = os.path.join(PROJECT_ROOT, "last_status.txt")
-                    if os.path.exists(status_path):
-                        with open(status_path, "r", encoding="utf-8") as sf:
-                            st = sf.read().strip()
-                            if "[GIT SUCCESS]" in st:
-                                done_phrase = st.replace("[GIT SUCCESS]", "").strip()
-                except Exception:
-                    pass
-                print(f"[Jarvis Pipeline] Announcing completion: {done_phrase}")
-                subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), done_phrase], cwd=PROJECT_ROOT)
-            else:
-                err_phrase = "Git operation could not be completed, sir."
-                try:
-                    status_path = os.path.join(PROJECT_ROOT, "last_status.txt")
-                    if os.path.exists(status_path):
-                        with open(status_path, "r", encoding="utf-8") as sf:
-                            st = sf.read().strip()
-                            if "[GIT ERROR]" in st:
-                                raw_err = st.replace("[GIT ERROR]", "").strip()
-                                err_phrase = f"Git error: {raw_err[:120]}, sir."
-                except Exception:
-                    pass
-                print(f"[Jarvis Pipeline] Announcing failure: {err_phrase}")
-                subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), err_phrase], cwd=PROJECT_ROOT)
-
-        elif itype == "antigravity_task":
-            start_phrase = spk_start or "On it, sir. Delegating task to Antigravity Agent."
-            print(f"[Jarvis Pipeline] Announcing start: {start_phrase}")
-            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), start_phrase], cwd=PROJECT_ROOT)
-
-            print("[Jarvis Pipeline] Step 3: Executing Antigravity Agent Bridge...")
-            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "execute_agent.py")], cwd=PROJECT_ROOT)
-
-            done_phrase = spk_resp or "Task completed, sir."
-            print(f"[Jarvis Pipeline] Announcing completion: {done_phrase}")
-            subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), done_phrase], cwd=PROJECT_ROOT)
-
-        else:  # general_qa or codebase_qa
-            if spk_resp:
-                print(f"[Jarvis Pipeline] Spoken QA Answer: {spk_resp}")
-                subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "speak.py"), spk_resp], cwd=PROJECT_ROOT)
+        process_transcript_pipeline(transcript, play_tts=True, source="voice")
 
     except Exception as e:
         print(f"[Jarvis Pipeline] Error during autonomous pipeline execution: {e}", file=sys.stderr)

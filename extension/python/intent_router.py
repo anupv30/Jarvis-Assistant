@@ -28,6 +28,7 @@ load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "").strip()
 
 from jarvis_config import (
     JARVIS_CORE_DIR,
@@ -1173,25 +1174,48 @@ def call_groq(transcript: str) -> dict:
 
     raise RuntimeError(f"Groq API error: {last_err}")
 
+def get_available_ollama_model() -> str:
+    """Detects available models in local Ollama instance or returns preferred default."""
+    preferred = os.getenv("OLLAMA_MODEL", "").strip()
+    if preferred:
+        return preferred
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=(1.5, 3.0))
+        if r.status_code == 200:
+            data = r.json()
+            models = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+            if models:
+                for priority in ["llama3.2", "llama3.1", "llama3", "llama3:8b", "qwen2.5-coder", "qwen2.5", "mistral", "phi3", "gemma"]:
+                    for m in models:
+                        if priority in m.lower():
+                            return m
+                return models[0]
+    except Exception:
+        pass
+    return "llama3:8b"
+
 def call_ollama(transcript: str) -> dict:
+    """Offline Fallback: Local Ollama chat inference with auto model discovery and strict JSON schema."""
+    model = get_available_ollama_model()
     system_prompt = build_system_prompt()
     resp = requests.post(
         f"{OLLAMA_HOST}/api/chat",
         json={
-            "model": "qwen2.5-coder:7b",
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"User: {transcript}"},
             ],
-            "options": {"temperature": 0.2, "num_predict": 150},
+            "options": {"temperature": 0.2, "num_predict": 180},
+            "format": "json",
             "stream": False,
         },
-        timeout=25,
+        timeout=(2.0, 25.0),
     )
     if resp.status_code == 200:
         content = resp.json().get("message", {}).get("content", "")
         return sanitize_json(content, transcript)
-    raise RuntimeError(f"Ollama HTTP {resp.status_code}")
+    raise RuntimeError(f"Ollama HTTP {resp.status_code} (model: {model})")
 
 def route_intent(transcript: str) -> dict:
     cleaned = transcript.strip()
@@ -1255,11 +1279,20 @@ def route_intent(transcript: str) -> dict:
     if is_antigravity_intent(cleaned):
         return build_default_intent(cleaned)
 
-    # 1. Primary: Groq Cloud API
-    try:
-        return call_groq(cleaned)
-    except Exception as e:
-        print(f"[intent_router.py] Groq fallback notice: {e}", file=sys.stderr)
+    # Check if Ollama / offline mode is explicitly requested
+    force_ollama = (
+        os.getenv("FORCE_OLLAMA", "false").lower() in ["true", "1", "yes"]
+        or os.getenv("FORCE_OFFLINE", "false").lower() in ["true", "1", "yes"]
+        or "--ollama" in sys.argv
+        or "--offline" in sys.argv
+    )
+
+    if not force_ollama:
+        # 1. Primary: Groq Cloud API
+        try:
+            return call_groq(cleaned)
+        except Exception as e:
+            print(f"[intent_router.py] Groq fallback notice: {e}", file=sys.stderr)
 
     # 2. Offline Fallback: Local Ollama
     try:

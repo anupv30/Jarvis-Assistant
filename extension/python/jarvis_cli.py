@@ -26,6 +26,7 @@ from jarvis_config import (
     get_current_git_branch,
     is_hud_running,
     launch_hud as run_hud_window,
+    get_python_exe,
 )
 
 # Set stdout/stderr to utf-8 safe
@@ -162,7 +163,8 @@ def start_jarvis(target_arg: str = None):
     listener_script = os.path.join(JARVIS_CORE_DIR, "jarvis_listener.py")
     hud_env = os.environ.copy()
     hud_env["TARGET_REPO_PATH"] = target_dir
-    subprocess.run([sys.executable, listener_script, "--project", target_dir], cwd=target_dir, env=hud_env)
+    python_bin = get_python_exe()
+    subprocess.run([python_bin, listener_script, "--project", target_dir], cwd=target_dir, env=hud_env)
 
 def launch_hud(target_arg: str = None):
     target_dir = get_target_repo(target_arg)
@@ -266,10 +268,44 @@ def uninit_project(target_arg: str = None):
     print(f"  - Active Workspace : {get_target_repo()}")
     print("=========================================================================\n")
 
+def execute_text_query(query_str: str, play_tts: bool = True):
+    from jarvis_listener import process_transcript_pipeline
+    print_banner()
+    print(f">> Executing Text Query: \"{query_str}\"")
+    result = process_transcript_pipeline(query_str, play_tts=play_tts, source="text")
+    print(f"\n>> Execution Status: {result.get('status', 'complete')}")
+    if "response" in result:
+        print(f">> Jarvis Response: {result['response']}")
+
+def run_interactive_text_mode():
+    from jarvis_listener import process_transcript_pipeline
+    print_banner()
+    print("  =========================================================================")
+    print("      JARVIS CYBERNETIC COMMAND INTERFACE - INTERACTIVE TEXT MODE")
+    print("      Type your command or query (e.g., 'commit and push changes', 'git status')")
+    print("      Type 'exit' or 'quit' to return.")
+    print("  =========================================================================\n")
+    while True:
+        try:
+            user_input = input("JARVIS [TEXT MODE] > ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ["exit", "quit", "q"]:
+                print("Exiting interactive text mode. Have a productive session, sir.")
+                break
+            result = process_transcript_pipeline(user_input, play_tts=True, source="text")
+            if "response" in result:
+                print(f"\nJARVIS > {result['response']}\n")
+        except (KeyboardInterrupt, EOFError):
+            print("\nSession terminated.")
+            break
+
 def show_help():
     print_banner()
     print("""
 Usage:
+  jarvis query "query"  Execute a direct text-based command or query.
+  jarvis text / chat    Launch interactive cybernetic text console.
   jarvis init [path]    Initialize Jarvis for current or specified project folder.
                         Ensures git, n8n background server, scaffolds launchers,
                         and immediately opens the Jarvis Sci-Fi HUD window.
@@ -288,10 +324,31 @@ def main():
         show_help()
         sys.exit(0)
 
-    cmd = args[0].lower().strip("-/")
-    target = " ".join(args[1:]).strip(' \t\r\n"\'') if len(args) > 1 else None
+    # Detect offline / ollama simulation flags
+    if "--ollama" in sys.argv:
+        os.environ["FORCE_OLLAMA"] = "true"
+        print("[Jarvis CLI] >> Local Ollama mode forced via --ollama flag")
+    if "--offline" in sys.argv:
+        os.environ["FORCE_OLLAMA"] = "true"
+        os.environ["FORCE_OFFLINE"] = "true"
+        print("[Jarvis CLI] >> Fully offline mode forced via --offline flag (Ollama + faster-whisper)")
 
-    if cmd == "init":
+    clean_args = [a for a in args if a not in ["--ollama", "--offline"]]
+    if not clean_args:
+        show_help()
+        sys.exit(0)
+
+    cmd = clean_args[0].lower().strip("-/")
+    target = " ".join(clean_args[1:]).strip(' \t\r\n"\'') if len(clean_args) > 1 else None
+
+    if cmd in ["query", "ask", "q", "do", "exec"]:
+        if not target:
+            print("Error: Please provide a query string. E.g. jarvis query \"commit and push changes\"")
+            sys.exit(1)
+        execute_text_query(target, play_tts=True)
+    elif cmd in ["text", "chat", "repl", "console", "i"]:
+        run_interactive_text_mode()
+    elif cmd == "init":
         init_project(target)
     elif cmd in ["uninit", "deinit", "remove", "unlink"]:
         uninit_project(target)

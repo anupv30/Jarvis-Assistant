@@ -125,8 +125,31 @@ def clean_spoken_text(text: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+def speak_offline_sapi(text: str) -> bool:
+    """Offline Windows Native TTS Fallback via SAPI.SpVoice or System.Speech."""
+    # 1. Primary Offline: COM SAPI.SpVoice
+    try:
+        import win32com.client
+        speaker = win32com.client.Dispatch("SAPI.SpVoice")
+        speaker.Rate = 1
+        speaker.Volume = 100
+        speaker.Speak(text)
+        return True
+    except Exception:
+        pass
+
+    # 2. Secondary Offline: PowerShell System.Speech
+    try:
+        escaped = text.replace("'", "''").replace('"', '`"')
+        cmd = f"Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak('{escaped}')"
+        subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, timeout=10)
+        return True
+    except Exception as e:
+        print(f"[TTS] Offline SAPI error: {e}", file=sys.stderr)
+        return False
+
 def speak_direct(text: str):
-    """Speaks text: plays pre-rendered MP3 if available, otherwise generates dynamic speech."""
+    """Speaks text: plays pre-rendered MP3 if available, otherwise generates dynamic speech with offline SAPI fallback."""
     clean = clean_spoken_text(text.strip())
     if not clean:
         return
@@ -155,8 +178,9 @@ def speak_direct(text: str):
         asyncio.run(generate_speech_audio(clean, temp_audio_file))
         play_audio_file(temp_audio_file)
     except Exception as e:
-        print(f"[TTS] edge-tts error: {e}", file=sys.stderr)
+        print(f"[TTS] Edge-TTS offline notice ({e}), speaking via offline Windows SAPI...", file=sys.stderr)
         cleanup_file(temp_audio_file)
+        speak_offline_sapi(clean)
 
 def resolve_phrase_from_args() -> str:
     """Resolves target phrase from CLI flags, intent files, or string arguments."""

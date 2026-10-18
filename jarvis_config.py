@@ -142,6 +142,16 @@ def is_hud_running() -> bool:
         pass
     return False
 
+def get_python_exe() -> str:
+    """Finds the Python interpreter that has all required Jarvis packages installed."""
+    user_py = r"C:\Users\Anup\AppData\Local\Programs\Python\Python312\python.exe"
+    if os.path.exists(user_py):
+        return user_py
+    py_cmd = shutil.which("py")
+    if py_cmd:
+        return py_cmd
+    return sys.executable
+
 def launch_hud(target_dir: str = None) -> bool:
     """Reliably launches the Jarvis HUD desktop GUI window directly."""
     raw = target_dir or get_target_repo()
@@ -159,7 +169,7 @@ def launch_hud(target_dir: str = None) -> bool:
     try:
         CREATE_NEW_CONSOLE = 0x00000010
         subprocess.Popen(
-            [sys.executable, hud_script, "--project", target],
+            [get_python_exe(), hud_script, "--project", target],
             cwd=target,
             env=hud_env,
             creationflags=CREATE_NEW_CONSOLE

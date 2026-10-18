@@ -22,16 +22,41 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 TRANSCRIPT_CACHE_FILE = os.path.join(PROJECT_ROOT, "last_transcript.txt")
 
+WHISPER_PROMPT = (
+    "Jarvis developer assistant: git commit, git status, git push, git branch, git checkout, "
+    "git pull, git revert, git diff, git stash, GitHub, create repository, merge, stage, codebase, "
+    "checkout main, switch branch, commit changes."
+)
+
 def sanitize_transcript(text: str) -> str:
-    """Removes irregular newlines, control characters, and excess whitespace."""
+    """Removes irregular newlines, control characters, filler words, and fixes common phonetic ASR confusions."""
     if not text:
         return ""
     cleaned = re.sub(r"[\r\n\t]+", " ", text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
+
+    # Strip accidental leading wake words
+    cleaned = re.sub(r"^(?:hey\s+)?jarvis[\s,\.\!:]*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^(?:please\s+|could\s+you\s+|can\s+you\s+)", "", cleaned, flags=re.IGNORECASE).strip()
+
+    # Correct common ASR misrecognitions for developer and Git terms
+    substitutions = [
+        (r"\bget\s+(status|commit|push|pull|branch|checkout|diff|log|stash|revert|remote|init|fetch|merge)\b", r"git \1"),
+        (r"\b(?:did|kid|good|give)\s+(status|commit|push|pull|branch|checkout|diff)\b", r"git \1"),
+        (r"\bchechout\b", "checkout"),
+        (r"\bcheck\s+out\b", "checkout"),
+        (r"\bcomit\b", "commit"),
+        (r"\bcoma\s+message\b", "commit message"),
+        (r"\bcoma\b", "commit"),
+        (r"\bstash\s+pop\b", "stash pop"),
+    ]
+    for pattern, replacement in substitutions:
+        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+
+    return cleaned.strip()
 
 def transcribe_with_groq(audio_path: str) -> str:
-    """Primary ASR: Groq Cloud API whisper-large-v3-turbo."""
+    """Primary ASR: Groq Cloud API whisper-large-v3 with developer vocabulary prompt bias."""
     if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
         raise ValueError("GROQ_API_KEY is not configured.")
 
@@ -40,32 +65,73 @@ def transcribe_with_groq(audio_path: str) -> str:
         "Authorization": f"Bearer {GROQ_API_KEY}",
     }
 
-    with open(audio_path, "rb") as f:
-        files = {
-            "file": (os.path.basename(audio_path), f, "audio/wav"),
-        }
-        data = {
-            "model": "whisper-large-v3-turbo",
-            "temperature": "0.0",
-            "response_format": "json",
-        }
-        response = requests.post(url, headers=headers, files=files, data=data, timeout=15)
+    # Try whisper-large-v3 first (highest accuracy), then turbo
+    models_to_try = ["whisper-large-v3", "whisper-large-v3-turbo"]
+    last_err = None
 
-    if response.status_code == 200:
-        result = response.json()
-        return sanitize_transcript(result.get("text", ""))
-    else:
-        raise RuntimeError(f"Groq Whisper HTTP {response.status_code}: {response.text}")
+    for model_name in models_to_try:
+        try:
+            with open(audio_path, "rb") as f:
+                files = {
+                    "file": (os.path.basename(audio_path), f, "audio/wav"),
+                }
+                data = {
+                    "model": model_name,
+                    "temperature": "0.0",
+                    "language": "en",
+                    "prompt": WHISPER_PROMPT,
+                    "response_format": "json",
+                }
+                response = requests.post(url, headers=headers, files=files, data=data, timeout=12)
+
+            if response.status_code == 200:
+                result = response.json()
+                raw_text = result.get("text", "")
+                return sanitize_transcript(raw_text)
+            else:
+                last_err = f"HTTP {response.status_code}: {response.text}"
+        except Exception as e:
+            last_err = str(e)
+
+    raise RuntimeError(f"Groq Whisper failed: {last_err}")
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 def transcribe_with_faster_whisper(audio_path: str) -> str:
-    """Offline Fallback ASR: Local faster-whisper tiny.en."""
-    from faster_whisper import WhisperModel
+    """Offline Fallback ASR: Local faster-whisper tiny.en with direct WAV numpy ingestion."""
+    try:
+        from faster_whisper import WhisperModel
+        import wave
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("faster-whisper or numpy is not installed in local environment.")
+
+    # Convert WAV to float32 numpy array to bypass PyAV container issues
+    audio_input = audio_path
+    try:
+        with wave.open(audio_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+            if sampwidth == 2:
+                raw_np = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sampwidth == 4:
+                raw_np = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                raw_np = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+            if n_channels > 1:
+                raw_np = raw_np.reshape(-1, n_channels).mean(axis=1)
+            audio_input = raw_np
+    except Exception:
+        audio_input = audio_path
 
     model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(
-        audio_path,
+        audio_input,
         beam_size=5,
         vad_filter=True,
+        initial_prompt=WHISPER_PROMPT,
         vad_parameters=dict(min_silence_duration_ms=400),
     )
     text_parts = [segment.text.strip() for segment in segments]
@@ -76,13 +142,19 @@ def transcribe(audio_path: str) -> str:
         print(f"[transcribe.py] Warning: File not found: {audio_path}", file=sys.stderr)
         return ""
 
-    # 1. Primary: Groq Cloud API
-    try:
-        text = transcribe_with_groq(audio_path)
-        if text:
-            return text
-    except Exception as e:
-        print(f"[transcribe.py] Groq Whisper notice ({e}), falling back to local faster-whisper...", file=sys.stderr)
+    force_offline = (
+        os.getenv("FORCE_OFFLINE", "false").lower() in ["true", "1", "yes"]
+        or "--offline" in sys.argv
+    )
+
+    if not force_offline:
+        # 1. Primary: Groq Cloud API (whisper-large-v3 + domain prompt)
+        try:
+            text = transcribe_with_groq(audio_path)
+            if text:
+                return text
+        except Exception as e:
+            print(f"[transcribe.py] Groq Whisper notice ({e}), falling back to offline faster-whisper...", file=sys.stderr)
 
     # 2. Offline Fallback: Local faster-whisper
     try:
